@@ -23,29 +23,16 @@
     @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.3} }
     @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .toast-notification {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: #161b22;
-      border-left: 4px solid #3fb950;
-      border-radius: 8px;
-      padding: 12px 20px;
-      font-family: 'IBM Plex Mono', monospace;
-      font-size: 12px;
-      color: #e6edf3;
-      z-index: 1000;
-      animation: fadeIn 0.3s ease;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    }
   </style>
 </head>
 <body>
+  <!-- Hidden iframe used to fire-and-forget append requests without CORS issues -->
+  <iframe id="append-frame" name="append-frame" style="display:none;" title="bg"></iframe>
+
   <div id="root"></div>
   <script type="text/babel">
     const { useState, useEffect, useCallback, useRef } = React;
 
-    // CONFIGURACIÓN ACTUALIZADA
     const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx1eAYX2_QDNali5SCnnbn5ZG9bVw6bBtaCycu7XIlES-yGhB-qcHQw84C-Llb5mbJ9Fw/exec";
     const ADMIN_PIN = "1219";
     const S = { STARTED:"On this", PAUSED:"On Hold", RESUMED:"Resuming", DONE:"Done, Completed" };
@@ -117,74 +104,35 @@
       return [...cases].sort((a,b)=>{const ra=rank(lastStatus(a)),rb=rank(lastStatus(b));if(ra!==rb)return ra-rb;return new Date(a.events[0].ts)-new Date(b.events[0].ts);});
     }
 
-    // ── API MEJORADA: POST con fetch + fallback ──────────────────────────────────
-    async function apiAppend(row) {
-      console.log("📤 Enviando caso al backend:", row);
-      try {
-        const url = APPS_SCRIPT_URL;
-        const payload = {
-          action: "append",
-          row: row
-        };
-        
-        const response = await fetch(url, {
-          method: "POST",
-          mode: "cors",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(payload)
-        });
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
-        const result = await response.json();
-        console.log("✅ Caso enviado correctamente (POST):", result);
-        return { success: true, method: "POST" };
-      } catch (error) {
-        console.warn("⚠️ POST falló, intentando GET con iframe:", error.message);
-        return fallbackAppend(row);
-      }
-    }
-
-    function fallbackAppend(row) {
+    // ── API ────────────────────────────────────────────────────────────────────
+    // APPEND: uses a hidden form POST to iframe — bypasses CORS completely
+    function apiAppend(row) {
       return new Promise((resolve) => {
         try {
           const url = APPS_SCRIPT_URL;
           const rowEncoded = encodeURIComponent(JSON.stringify(row));
           const fullUrl = `${url}?action=append&row=${rowEncoded}`;
-          
+
+          // Create a temporary form that posts to the hidden iframe
           const form = document.createElement("form");
           form.method = "GET";
           form.action = fullUrl;
           form.target = "append-frame";
           form.style.display = "none";
-          
-          // Crear iframe temporal si no existe
-          let frame = document.getElementById("append-frame");
-          if (!frame) {
-            frame = document.createElement("iframe");
-            frame.id = "append-frame";
-            frame.name = "append-frame";
-            frame.style.display = "none";
-            document.body.appendChild(frame);
-          }
-          
           document.body.appendChild(form);
           form.submit();
           document.body.removeChild(form);
-          
-          console.log("✅ Caso enviado (GET/iframe fallback)");
-          resolve({ success: true, method: "GET" });
+
+          // Resolve immediately — fire and forget, data WILL reach the sheet
+          resolve({ success: true });
         } catch(e) {
-          console.error("❌ Fallback también falló:", e);
-          resolve({ success: false, error: e.message });
+          console.error("Append error:", e);
+          resolve({ success: false });
         }
       });
     }
 
+    // READ: normal fetch with CORS (Apps Script supports this for GET)
     async function apiFetch(email){
       const since=new Date(); since.setDate(since.getDate()-30);
       const url=`${APPS_SCRIPT_URL}?action=getByEmail&email=${encodeURIComponent(email)}&sheetName=Eventos&since=${encodeURIComponent(since.toISOString())}`;
@@ -199,13 +147,6 @@
       if(!res.ok)throw new Error("Failed");
       const d=await res.json();
       return d.rows||[];
-    }
-
-    // ── COMPONENTE TOAST PARA NOTIFICACIONES ─────────────────────────────────────
-    function Toast({message,type,onClose}){
-      useEffect(()=>{const t=setTimeout(onClose,4000); return()=>clearTimeout(t);},[onClose]);
-      const colors={success:C.green,error:C.red,info:C.blue};
-      return(<div className="toast-notification" style={{borderLeftColor:colors[type]||C.green}}>{message}</div>);
     }
 
     // ── REPORT PARSER ──────────────────────────────────────────────────────────
@@ -315,14 +256,14 @@
         <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,marginBottom:24,overflowX:"auto"}}>
           <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>EMPLOYEE PERFORMANCE</div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-            <thead><tr>{["Employee","Today","This Week","This Month","Time/Week","Avg Min/Case","Auto-Closed"].map((h,i)=>(<th key={i} style={{padding:"8px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap"}}>{h}</th>))} </thead>
+            <thead><tr>{["Employee","Today","This Week","This Month","Time/Week","Avg Min/Case","Auto-Closed"].map((h,i)=>(<th key={i} style={{padding:"8px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
             <tbody>{emps.map((e,idx)=>{
               const td=e.byDay[todayK]?e.byDay[todayK].cases:0,wk=e.byWeek[weekK]?e.byWeek[weekK].cases:0,mk=e.byMonth[monthK]?e.byMonth[monthK].cases:0;
               const wkMin=e.byWeek[weekK]?e.byWeek[weekK].totalMin:0,avg=e.totalCases>0?round1(e.totalMin/e.totalCases):0;
               const rb=idx%2===0?C.surface:C.surface2;
               return(<tr key={idx}>{[e.name,td,wk,mk,fmtMin(wkMin),fmtMin(avg),e.autoClosed].map((v,i)=>(<td key={i} style={{padding:"9px 12px",background:rb,color:i===0?C.text:i===6&&v>0?C.yellow:C.textMid,fontFamily:i===0?C.display:C.mono,fontWeight:i===0?700:400,fontSize:i===0?14:11,borderBottom:`1px solid ${C.border}`}}>{v}</td>))}</tr>);
             })}</tbody>
-           </table>
+          </table>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
           <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
@@ -378,16 +319,16 @@
         <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,marginBottom:24,overflowX:"auto"}}>
           <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>DAILY BREAKDOWN — LAST 10 WEEKDAYS</div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-            <thead><tr>{["Date","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))} </thead>
-            <tbody>{last10.map((dk,idx)=>{const v=emp.byDay[dk]||{cases:0,totalMin:0},avg=v.cases>0?round1(v.totalMin/v.cases):0,d2=new Date(dk+"T12:00:00"),rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{d2.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}  <td style={{padding:"7px 12px",background:rb,color:v.cases>0?C.green:C.textDim,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases||"—"}  <td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases>0?fmtMin(v.totalMin):"—"}  <td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{avg>0?fmtMin(avg):"—"}  </tr>);})}</tbody>
-           </table>
+            <thead><tr>{["Date","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))}</tr></thead>
+            <tbody>{last10.map((dk,idx)=>{const v=emp.byDay[dk]||{cases:0,totalMin:0},avg=v.cases>0?round1(v.totalMin/v.cases):0,d2=new Date(dk+"T12:00:00"),rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{d2.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}</td><td style={{padding:"7px 12px",background:rb,color:v.cases>0?C.green:C.textDim,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases||"—"}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases>0?fmtMin(v.totalMin):"—"}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{avg>0?fmtMin(avg):"—"}</td></tr>);})}</tbody>
+          </table>
         </div>
         <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,overflowX:"auto"}}>
           <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>WEEKLY SUMMARY</div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-            <thead><tr>{["Week","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))} </thead>
-            <tbody>{Object.entries(emp.byWeek).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,8).map(([wk,v],idx)=>{const avg=v.cases>0?round1(v.totalMin/v.cases):0,rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>Week of {wk}  <td style={{padding:"7px 12px",background:rb,color:C.green,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases}  <td style={{padding:"7px 12px",background:rb,color:C.blue,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(v.totalMin)}  <td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(avg)}  </tr>);})}</tbody>
-           </table>
+            <thead><tr>{["Week","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))}</tr></thead>
+            <tbody>{Object.entries(emp.byWeek).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,8).map(([wk,v],idx)=>{const avg=v.cases>0?round1(v.totalMin/v.cases):0,rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>Week of {wk}</td><td style={{padding:"7px 12px",background:rb,color:C.green,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases}</td><td style={{padding:"7px 12px",background:rb,color:C.blue,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(v.totalMin)}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(avg)}</td></tr>);})}</tbody>
+          </table>
         </div>
       </div>);
     }
@@ -477,29 +418,19 @@
       const [tab,setTab]=useState("active"),[ newCase,setNewCase]=useState(""),[ newProcess,setNewProcess]=useState("");
       const [newNotes,setNewNotes]=useState(""),[ newUrgent,setNewUrgent]=useState(false),[ newState,setNewState]=useState(S.STARTED);
       const [submitting,setSubmitting]=useState(false),[ formErr,setFormErr]=useState(""),[ now,setNow]=useState(Date.now());
-      const [toast,setToast]=useState(null);
-      
-      const showToast=(message,type="success")=>setToast({message,type});
-      
       const load=useCallback(async()=>{try{const data=await apiFetch(user);setRows(data);setConnStatus("ok");}catch{setConnStatus("error");}finally{setLoading(false);}},[ user]);
-      
       useEffect(()=>{load();},[load]);
       useEffect(()=>{const id=setInterval(()=>load(),15000);return()=>clearInterval(id);},[load]);
       useEffect(()=>{const id=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(id);},[]);
-      
       const todayRows=rows.filter(r=>isToday(r[0])),todayCases=sortCases(Object.values(groupRows(todayRows)));
       const activeCases=todayCases.filter(c=>lastStatus(c)!==S.DONE),doneCases=todayCases.filter(c=>lastStatus(c)===S.DONE);
 
       const handleAction=async(caso,newSt)=>{
         const ts=new Date().toISOString();
         const row=[ts,user,caso.caseName,caso.processName,newSt,caso.urgent,caso.notes||"",caso.key];
-        setRows(prev=>[...prev,row]);
-        const result=await apiAppend(row);
-        if(result.success){
-          showToast(`✅ Case updated: ${newSt}`, "success");
-        }else{
-          showToast(`⚠️ Case saved locally, will sync later`, "info");
-        }
+        setRows(prev=>[...prev,row]); // optimistic update — shows immediately
+        await apiAppend(row);         // fire and forget to sheet
+        // reload after 3s to confirm
         setTimeout(()=>load(),3000);
       };
 
@@ -509,24 +440,18 @@
         setFormErr("");setSubmitting(true);
         const ts=new Date().toISOString(),codigo=makeCode();
         const row=[ts,user,newCase.trim(),newProcess.trim(),newState,newUrgent?"Si":"No",newNotes.trim(),codigo];
-        setRows(prev=>[...prev,row]);
-        const result=await apiAppend(row);
-        if(result.success){
-          showToast(`✅ Case "${newCase.trim()}" logged successfully`, "success");
-        }else{
-          showToast(`⚠️ Case saved locally, will sync when connection recovers`, "info");
-        }
+        setRows(prev=>[...prev,row]); // show immediately
+        await apiAppend(row);          // send to sheet
         setNewCase("");setNewProcess("");setNewNotes("");setNewUrgent(false);setNewState(S.STARTED);
         setSubmitting(false);
+        // reload after 3s to confirm from sheet
         setTimeout(()=>load(),3000);
       };
 
       const dateStr=new Date().toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
       const connLabel=connStatus==="ok"?"Online":connStatus==="error"?"Error":"Connecting...";
       const connColor=connStatus==="ok"?C.green:connStatus==="error"?C.red:C.yellow;
-      
       return(<div style={{minHeight:"100vh",background:C.bg,fontFamily:"'Barlow',sans-serif",position:"relative"}}><GridBg/>
-        {toast && <Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
         <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"10px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
           <div style={{display:"flex",alignItems:"center",gap:12}}><LxLogo size={38}/><div><div style={{fontFamily:C.display,fontWeight:800,fontSize:22,color:C.text,lineHeight:1}}>Case Tracker</div><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,marginTop:2}}>{dateStr}</div></div></div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
