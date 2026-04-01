@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lexington Recovery — Case Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #0d1117; font-family: 'Barlow', sans-serif; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    input, select, button, textarea { font-family: inherit; }
+    input:focus, select:focus, textarea:focus { outline: none; }
+    @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.3} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <!-- Hidden iframe used to fire-and-forget append requests without CORS issues -->
+  <iframe id="append-frame" name="append-frame" style="display:none;" title="bg"></iframe>
+
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwXwaqJQDK7VwxrVA4BCNdG-HDu_HU-6IlJOr1QUE5fAi7sHZWVEp-tUVUZWfnLcckh/exec";
+    const ADMIN_PIN = "1219";
+    const S = { STARTED:"On this", PAUSED:"On Hold", RESUMED:"Resuming", DONE:"Done, Completed" };
+    const C = {
+      bg:"#0d1117", surface:"#161b22", surface2:"#21262d", border:"#30363d", borderActive:"#238636",
+      blue:"#4d9cf8", green:"#3fb950", yellow:"#d29922", red:"#da3633",
+      text:"#e6edf3", textMid:"#8b949e", textDim:"#484f58",
+      mono:"'IBM Plex Mono', monospace", display:"'Barlow Condensed', sans-serif",
+    };
+
+    // ── UTILS ──────────────────────────────────────────────────────────────────
+    function makeCode() { return `${Date.now()}${Math.floor(Math.random()*900000)+100000}`; }
+    function delay(ms)  { return new Promise(r=>setTimeout(r,ms)); }
+    function isToday(ts){ const d=new Date(ts),n=new Date(); return d.getDate()===n.getDate()&&d.getMonth()===n.getMonth()&&d.getFullYear()===n.getFullYear(); }
+    function getDateKey(ts){ const d=new Date(ts); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
+    function getWeekKey(d){ const m=new Date(d); m.setDate(d.getDate()-d.getDay()+1); return getDateKey(m); }
+    function getMonthKey(d){ return `${d.getFullYear()}-${d.getMonth()}`; }
+    function friendlyDate(dk){ return new Date(dk+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"}); }
+    function fmtMin(min){ if(!min||min<0)return"0m"; const h=Math.floor(min/60),m=Math.round(min%60); return h>0?`${h}h ${m}m`:`${m}m`; }
+    function formatElapsed(ms){ if(!ms||ms<0)return"0s"; const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60; if(h>0)return`${h}h ${m}m`; if(m>0)return`${m}m ${sec}s`; return`${sec}s`; }
+    function isWeekday(d){ const dow=new Date(d).getDay(); return dow!==0&&dow!==6; }
+    function round1(n){ return Math.round(n*10)/10; }
+
+    function similarity(a,b){
+      a=a.toLowerCase().trim();b=b.toLowerCase().trim();
+      const m=a.length,n=b.length;
+      if(m===0||n===0)return m===n?1:0;
+      const dp=Array.from({length:m+1},(_,i)=>Array.from({length:n+1},(_,j)=>i===0?j:j===0?i:0));
+      for(let i=1;i<=m;i++)for(let j=1;j<=n;j++)
+        dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);
+      return 1-dp[m][n]/Math.max(m,n);
+    }
+    function groupProcessNames(names){
+      const T=0.65,groups=[],assigned={};
+      names.forEach(name=>{
+        if(assigned[name]!==undefined)return;
+        let found=false;
+        for(const g of groups){if(similarity(name,g.canonical)>=T){g.members.push(name);assigned[name]=g.canonical;found=true;break;}}
+        if(!found){groups.push({canonical:name,members:[name]});assigned[name]=name;}
+      });
+      return assigned;
+    }
+
+    function computeElapsed(events,now=Date.now()){
+      let total=0,lastStart=null;
+      for(const e of events){const t=new Date(e.ts).getTime();if(e.status===S.STARTED||e.status===S.RESUMED){lastStart=t;}else if((e.status===S.PAUSED||e.status===S.DONE)&&lastStart!==null){total+=t-lastStart;lastStart=null;}}
+      if(lastStart!==null)total+=now-lastStart;
+      return total;
+    }
+    function groupRows(rows){
+      const map={};
+      for(const r of rows){
+        const [ts,,caseName,processName,status,urgent,notes,codigoUnico]=r;
+        const dk=getDateKey(ts);
+        const key=(codigoUnico&&String(codigoUnico).trim())?String(codigoUnico).trim():`${caseName}__${dk}`;
+        if(!map[key])map[key]={key,caseName,processName,urgent:"No",notes:"",events:[],dk};
+        map[key].events.push({ts,status,urgent,notes});
+        if(urgent==="Si")map[key].urgent="Si";
+        if(notes&&String(notes).trim())map[key].notes=String(notes).trim();
+        map[key].processName=processName;
+      }
+      for(const k of Object.keys(map))map[k].events.sort((a,b)=>new Date(a.ts)-new Date(b.ts));
+      return map;
+    }
+    function lastStatus(caso){const ev=caso.events;return ev.length?ev[ev.length-1].status:null;}
+    function pauseCount(caso){return caso.events.filter(e=>e.status===S.PAUSED).length;}
+    function sortCases(cases){
+      const rank=s=>s===S.STARTED||s===S.RESUMED?0:s===S.PAUSED?1:2;
+      return [...cases].sort((a,b)=>{const ra=rank(lastStatus(a)),rb=rank(lastStatus(b));if(ra!==rb)return ra-rb;return new Date(a.events[0].ts)-new Date(b.events[0].ts);});
+    }
+
+    // ── API ────────────────────────────────────────────────────────────────────
+    // APPEND: new Image() trick — zero CORS issues, guaranteed fire-and-forget
+    function apiAppend(row) {
+      const rowEncoded = encodeURIComponent(JSON.stringify(row));
+      const fullUrl = `${APPS_SCRIPT_URL}?action=append&row=${rowEncoded}`;
+      const img = new Image();
+      img.src = fullUrl;
+      return Promise.resolve({ success: true });
+    }
+
+    // READ: normal fetch with CORS (Apps Script supports this for GET)
+    async function apiFetch(email){
+      const since=new Date(); since.setDate(since.getDate()-30);
+      const url=`${APPS_SCRIPT_URL}?action=getByEmail&email=${encodeURIComponent(email)}&sheetName=Eventos&since=${encodeURIComponent(since.toISOString())}`;
+      const res=await fetch(url,{redirect:"follow"});
+      if(!res.ok)throw new Error("Failed");
+      const d=await res.json();
+      return d.rows||[];
+    }
+
+    async function apiFetchReport(){
+      const res=await fetch(`${APPS_SCRIPT_URL}?action=getReport`,{redirect:"follow"});
+      if(!res.ok)throw new Error("Failed");
+      const d=await res.json();
+      return d.rows||[];
+    }
+
+    // ── REPORT PARSER ──────────────────────────────────────────────────────────
+    function parseReportRows(rows){
+      const allProcNames=[];
+      rows.forEach(r=>{const p=String(r[2]).trim();if(p&&!allProcNames.includes(p))allProcNames.push(p);});
+      const pgm=groupProcessNames(allProcNames);
+      const now=new Date(),empMap={},procMap={};
+      rows.forEach(row=>{
+        const email=String(row[3]).trim(),startR=row[4],endR=row[5];
+        const procR=String(row[2]).trim(),timeMin=parseFloat(row[18])||0;
+        const notes=String(row[7]||""),autoClosed=notes.indexOf("[Auto-closed at 6PM]")>=0;
+        if(!startR||!endR)return;
+        const startD=startR instanceof Date?startR:new Date(startR);
+        if(isNaN(startD)||!isWeekday(startD))return;
+        const proc=pgm[procR]||procR,dk=getDateKey(startD),wk=getWeekKey(startD),mk=getMonthKey(startD);
+        if(!empMap[email])empMap[email]={email,name:email.split("@")[0],byDay:{},byWeek:{},byMonth:{},totalMin:0,totalCases:0,byProcess:{},autoClosed:0,allTimes:[]};
+        const e=empMap[email];
+        e.totalMin+=timeMin;e.totalCases+=1;e.allTimes.push(timeMin);
+        if(autoClosed)e.autoClosed+=1;
+        if(!e.byDay[dk])e.byDay[dk]={cases:0,totalMin:0};
+        if(!e.byWeek[wk])e.byWeek[wk]={cases:0,totalMin:0};
+        if(!e.byMonth[mk])e.byMonth[mk]={cases:0,totalMin:0};
+        if(!e.byProcess[proc])e.byProcess[proc]={cases:0,totalMin:0};
+        e.byDay[dk].cases++;e.byDay[dk].totalMin+=timeMin;
+        e.byWeek[wk].cases++;e.byWeek[wk].totalMin+=timeMin;
+        e.byMonth[mk].cases++;e.byMonth[mk].totalMin+=timeMin;
+        e.byProcess[proc].cases++;e.byProcess[proc].totalMin+=timeMin;
+        if(!procMap[proc])procMap[proc]={cases:0,totalMin:0};
+        procMap[proc].cases++;procMap[proc].totalMin+=timeMin;
+      });
+      return {empMap,procMap,now};
+    }
+
+    // ── SHARED COMPONENTS ──────────────────────────────────────────────────────
+    const GridBg=()=>(<div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,backgroundImage:`linear-gradient(rgba(48,54,61,0.25) 1px,transparent 1px),linear-gradient(90deg,rgba(48,54,61,0.25) 1px,transparent 1px)`,backgroundSize:"40px 40px"}}/>);
+    const LxLogo=({size=48})=>(<div style={{width:size,height:size,borderRadius:size*0.22,background:"linear-gradient(135deg,#4d9cf8 0%,#1a5ccf 100%)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><span style={{fontFamily:C.display,fontWeight:800,fontSize:size*0.38,color:"#0d1117"}}>LX</span></div>);
+    function StatCard({label,value,sub,color}){return(<div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px 16px"}}><div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.08em",marginBottom:6}}>{label}</div><div style={{fontFamily:C.display,fontWeight:800,fontSize:22,color:color||C.text}}>{value}</div>{sub&&<div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,marginTop:3}}>{sub}</div>}</div>);}
+
+    function BarChart({labels,datasets,height=180}){
+      const ref=useRef(null),chartRef=useRef(null);
+      useEffect(()=>{
+        if(!ref.current)return;
+        if(chartRef.current)chartRef.current.destroy();
+        chartRef.current=new Chart(ref.current,{type:"bar",data:{labels,datasets:datasets.map(d=>({...d,borderRadius:4,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:C.textMid,font:{size:9}},grid:{color:"#21262d"}},y:{ticks:{color:C.textMid,font:{size:9}},grid:{color:"#21262d"},beginAtZero:true}}}});
+        return()=>{if(chartRef.current)chartRef.current.destroy();};
+      },[JSON.stringify({labels,datasets})]);
+      return <div style={{position:"relative",height}}><canvas ref={ref}/></div>;
+    }
+    function DoughnutChart({labels,data,colors,height=180}){
+      const ref=useRef(null),chartRef=useRef(null);
+      useEffect(()=>{
+        if(!ref.current)return;
+        if(chartRef.current)chartRef.current.destroy();
+        chartRef.current=new Chart(ref.current,{type:"doughnut",data:{labels,datasets:[{data,backgroundColor:colors,borderColor:C.bg,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},cutout:"65%"}});
+        return()=>{if(chartRef.current)chartRef.current.destroy();};
+      },[JSON.stringify({labels,data,colors})]);
+      return <div style={{position:"relative",height}}><canvas ref={ref}/></div>;
+    }
+
+    // ── ADMIN PIN ──────────────────────────────────────────────────────────────
+    function AdminLogin({onSuccess,onBack}){
+      const [pin,setPin]=useState(""),[ err,setErr]=useState(""),[ shake,setShake]=useState(false);
+      const press=(d)=>{
+        if(pin.length>=4)return;
+        const next=pin+d;setPin(next);
+        if(next.length===4){
+          if(next===ADMIN_PIN){onSuccess();}
+          else{setErr("Incorrect PIN");setShake(true);setTimeout(()=>{setPin("");setShake(false);setErr("");},700);}
+        }
+      };
+      const digits=["1","2","3","4","5","6","7","8","9","","0","⌫"];
+      return(<div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",position:"relative"}}><GridBg/><div style={{zIndex:1,width:"100%",maxWidth:340,animation:"fadeIn 0.3s ease"}}><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:32,justifyContent:"center"}}><LxLogo size={44}/><div><div style={{fontFamily:C.display,fontWeight:800,fontSize:22,color:C.text}}>Admin Access</div><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid}}>Enter 4-digit PIN</div></div></div><div style={{background:C.surface,border:`1px solid ${shake?C.red:C.border}`,borderRadius:16,padding:"28px 24px",transition:"border-color 0.2s"}}><div style={{display:"flex",gap:12,justifyContent:"center",marginBottom:24}}>{[0,1,2,3].map(i=>(<div key={i} style={{width:14,height:14,borderRadius:"50%",background:pin.length>i?C.blue:C.surface2,border:`2px solid ${pin.length>i?C.blue:C.border}`,transition:"all 0.15s"}}/>))}</div>{err&&<div style={{fontFamily:C.mono,fontSize:11,color:C.red,textAlign:"center",marginBottom:16}}>{err}</div>}<div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>{digits.map((d,i)=>(<button key={i} onClick={()=>d==="⌫"?setPin(p=>p.slice(0,-1)):d?press(d):null} style={{padding:"16px",background:d?C.surface2:"transparent",border:`1px solid ${d?C.border:"transparent"}`,borderRadius:10,color:d==="⌫"?C.textMid:C.text,fontSize:d==="⌫"?18:20,fontWeight:700,cursor:d?"pointer":"default",fontFamily:C.display,transition:"background 0.1s"}}>{d}</button>))}</div></div><button onClick={onBack} style={{width:"100%",marginTop:16,padding:"10px",background:"transparent",border:`1px solid ${C.border}`,borderRadius:10,color:C.textMid,fontFamily:C.mono,fontSize:12,cursor:"pointer"}}>← Back to App</button></div></div>);
+    }
+
+    // ── ADMIN OVERVIEW ─────────────────────────────────────────────────────────
+    function AdminOverview({parsed}){
+      const {empMap,procMap,now}=parsed;
+      const emps=Object.values(empMap).sort((a,b)=>b.totalCases-a.totalCases);
+      const todayK=getDateKey(now),weekK=getWeekKey(now),monthK=getMonthKey(now);
+      const totalToday=emps.reduce((s,e)=>s+(e.byDay[todayK]?e.byDay[todayK].cases:0),0);
+      const totalWeek=emps.reduce((s,e)=>s+(e.byWeek[weekK]?e.byWeek[weekK].cases:0),0);
+      const totalMonth=emps.reduce((s,e)=>s+(e.byMonth[monthK]?e.byMonth[monthK].cases:0),0);
+      const allTimes=emps.flatMap(e=>e.allTimes);
+      const avgTime=allTimes.length>0?round1(allTimes.reduce((a,b)=>a+b,0)/allTimes.length):0;
+      const topProcs=Object.entries(procMap).map(([p,v])=>({p,cases:v.cases,avg:v.cases>0?round1(v.totalMin/v.cases):0})).sort((a,b)=>b.avg-a.avg).slice(0,5);
+      const allProcs=Object.entries(procMap).sort((a,b)=>b[1].cases-a[1].cases).slice(0,8).map(e=>e[0]);
+      const palette=["#4d9cf8","#3fb950","#d29922","#da3633","#a371f7","#f78166","#ffa657","#79c0ff"];
+      return(<div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
+          <StatCard label="CASES TODAY" value={totalToday} sub="all employees" color={C.green}/>
+          <StatCard label="CASES THIS WEEK" value={totalWeek} sub="weekdays only" color={C.blue}/>
+          <StatCard label="CASES THIS MONTH" value={totalMonth} color={C.text}/>
+          <StatCard label="AVG TIME / CASE" value={fmtMin(avgTime)} sub="all employees" color={C.yellow}/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1.6fr 1fr",gap:16,marginBottom:24}}>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>CASES THIS WEEK BY EMPLOYEE</div>
+            <BarChart labels={emps.map(e=>e.name)} datasets={[{label:"Cases",data:emps.map(e=>e.byWeek[weekK]?e.byWeek[weekK].cases:0),backgroundColor:palette.slice(0,emps.length)}]} height={160}/>
+          </div>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>TOP PROCESSES</div>
+            <DoughnutChart labels={topProcs.map(p=>p.p)} data={topProcs.map(p=>p.cases)} colors={palette} height={150}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>{topProcs.map((p,i)=>(<div key={i} style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:8,height:8,borderRadius:2,background:palette[i],flexShrink:0}}/><span style={{fontFamily:C.mono,fontSize:9,color:C.textMid}}>{p.p} ({p.cases})</span></div>))}</div>
+          </div>
+        </div>
+        <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,marginBottom:24,overflowX:"auto"}}>
+          <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>EMPLOYEE PERFORMANCE</div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead><tr>{["Employee","Today","This Week","This Month","Time/Week","Avg Min/Case","Auto-Closed"].map((h,i)=>(<th key={i} style={{padding:"8px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
+            <tbody>{emps.map((e,idx)=>{
+              const td=e.byDay[todayK]?e.byDay[todayK].cases:0,wk=e.byWeek[weekK]?e.byWeek[weekK].cases:0,mk=e.byMonth[monthK]?e.byMonth[monthK].cases:0;
+              const wkMin=e.byWeek[weekK]?e.byWeek[weekK].totalMin:0,avg=e.totalCases>0?round1(e.totalMin/e.totalCases):0;
+              const rb=idx%2===0?C.surface:C.surface2;
+              return(<tr key={idx}>{[e.name,td,wk,mk,fmtMin(wkMin),fmtMin(avg),e.autoClosed].map((v,i)=>(<td key={i} style={{padding:"9px 12px",background:rb,color:i===0?C.text:i===6&&v>0?C.yellow:C.textMid,fontFamily:i===0?C.display:C.mono,fontWeight:i===0?700:400,fontSize:i===0?14:11,borderBottom:`1px solid ${C.border}`}}>{v}</td>))}</tr>);
+            })}</tbody>
+          </table>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>TOP 5 SLOWEST PROCESSES</div>
+            {topProcs.map((p,i)=>{const rc=[C.red,C.yellow,C.textMid,C.textMid,C.textMid][i],pct=topProcs[0].avg>0?p.avg/topProcs[0].avg*100:0;return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}><span style={{fontFamily:C.mono,fontSize:11,color:rc,fontWeight:700,width:16}}>#{i+1}</span><span style={{fontFamily:C.display,fontWeight:700,fontSize:13,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.p}</span><span style={{fontFamily:C.mono,fontSize:11,color:C.blue,flexShrink:0}}>{fmtMin(p.avg)}</span><div style={{width:60,height:5,background:C.surface2,borderRadius:3,flexShrink:0}}><div style={{width:`${pct}%`,height:"100%",background:rc,borderRadius:3}}/></div></div>);})}
+          </div>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,overflowX:"auto"}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>CASES BY PROCESS (TOP 8)</div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+              <thead><tr><th style={{padding:"4px 6px",background:C.surface2,color:C.blue,fontFamily:C.mono,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>Emp</th>{allProcs.map((p,i)=><th key={i} style={{padding:"4px 6px",background:C.surface2,color:C.blue,fontFamily:C.mono,textAlign:"center",borderBottom:`1px solid ${C.border}`,maxWidth:60,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p}</th>)}</tr></thead>
+              <tbody>{emps.map((e,idx)=>(<tr key={idx}><td style={{padding:"4px 6px",background:idx%2===0?C.surface:C.surface2,color:C.text,fontFamily:C.display,fontWeight:700,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{e.name}</td>{allProcs.map((p,i)=>{const cnt=e.byProcess[p]?e.byProcess[p].cases:0;return<td key={i} style={{padding:"4px 6px",background:idx%2===0?C.surface:C.surface2,color:cnt===0?C.textDim:C.green,fontFamily:C.mono,textAlign:"center",borderBottom:`1px solid ${C.border}`}}>{cnt||"—"}</td>;})}</tr>))}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>);
+    }
+
+    // ── EMPLOYEE DETAIL ────────────────────────────────────────────────────────
+    function EmployeeDetail({emp,now}){
+      const todayK=getDateKey(now),weekK=getWeekKey(now),monthK=getMonthKey(now);
+      const sorted=emp.allTimes.slice().sort((a,b)=>a-b);
+      const fastest=sorted[0]?round1(sorted[0]):0,slowest=sorted[sorted.length-1]?round1(sorted[sorted.length-1]):0,median=sorted.length>0?round1(sorted[Math.floor(sorted.length/2)]):0;
+      const avgTime=emp.totalCases>0?round1(emp.totalMin/emp.totalCases):0,wkMin=emp.byWeek[weekK]?emp.byWeek[weekK].totalMin:0;
+      const last14=[]; const d=new Date(now); d.setHours(0,0,0,0);
+      while(last14.length<14){if(d.getDay()!==0&&d.getDay()!==6)last14.unshift(getDateKey(new Date(d)));d.setDate(d.getDate()-1);}
+      const procEntries=Object.entries(emp.byProcess).sort((a,b)=>b[1].cases-a[1].cases).slice(0,6);
+      const procColors=["#4d9cf8","#3fb950","#d29922","#da3633","#a371f7","#f78166"];
+      const last10=last14.slice(-10);
+      return(<div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
+          <StatCard label="CASES TODAY" value={emp.byDay[todayK]?emp.byDay[todayK].cases:0} color={C.green}/>
+          <StatCard label="CASES THIS WEEK" value={emp.byWeek[weekK]?emp.byWeek[weekK].cases:0} color={C.blue}/>
+          <StatCard label="CASES THIS MONTH" value={emp.byMonth[monthK]?emp.byMonth[monthK].cases:0}/>
+          <StatCard label="TIME THIS WEEK" value={fmtMin(wkMin)} color={C.yellow}/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
+          <StatCard label="AVG TIME / CASE" value={fmtMin(avgTime)}/>
+          <StatCard label="FASTEST CASE" value={fmtMin(fastest)} color={C.green}/>
+          <StatCard label="SLOWEST CASE" value={fmtMin(slowest)} color={C.red}/>
+          <StatCard label="AUTO-CLOSED" value={emp.autoClosed} color={emp.autoClosed>3?C.yellow:C.textMid}/>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1.6fr 1fr",gap:16,marginBottom:24}}>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>DAILY CASES — LAST 14 WEEKDAYS</div>
+            <BarChart labels={last14.map(dk=>{const d2=new Date(dk+"T12:00:00");return d2.toLocaleDateString("en-US",{month:"short",day:"numeric"});})} datasets={[{label:"Cases",data:last14.map(dk=>emp.byDay[dk]?emp.byDay[dk].cases:0),backgroundColor:C.blue}]} height={160}/>
+          </div>
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>CASES BY PROCESS</div>
+            <DoughnutChart labels={procEntries.map(([p])=>p)} data={procEntries.map(([,v])=>v.cases)} colors={procColors} height={150}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>{procEntries.map(([p,v],i)=>(<div key={i} style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:8,height:8,borderRadius:2,background:procColors[i],flexShrink:0}}/><span style={{fontFamily:C.mono,fontSize:9,color:C.textMid}}>{p} ({v.cases})</span></div>))}</div>
+          </div>
+        </div>
+        <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,marginBottom:24,overflowX:"auto"}}>
+          <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>DAILY BREAKDOWN — LAST 10 WEEKDAYS</div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead><tr>{["Date","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))}</tr></thead>
+            <tbody>{last10.map((dk,idx)=>{const v=emp.byDay[dk]||{cases:0,totalMin:0},avg=v.cases>0?round1(v.totalMin/v.cases):0,d2=new Date(dk+"T12:00:00"),rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{d2.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}</td><td style={{padding:"7px 12px",background:rb,color:v.cases>0?C.green:C.textDim,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases||"—"}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases>0?fmtMin(v.totalMin):"—"}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{avg>0?fmtMin(avg):"—"}</td></tr>);})}</tbody>
+          </table>
+        </div>
+        <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:16,overflowX:"auto"}}>
+          <div style={{fontFamily:C.mono,fontSize:10,color:C.textMid,letterSpacing:"0.1em",marginBottom:12}}>WEEKLY SUMMARY</div>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+            <thead><tr>{["Week","Cases","Time Worked","Avg Min/Case"].map((h,i)=>(<th key={i} style={{padding:"7px 12px",background:C.surface2,color:C.blue,fontFamily:C.mono,fontSize:10,textAlign:"left",borderBottom:`1px solid ${C.border}`}}>{h}</th>))}</tr></thead>
+            <tbody>{Object.entries(emp.byWeek).sort((a,b)=>b[0].localeCompare(a[0])).slice(0,8).map(([wk,v],idx)=>{const avg=v.cases>0?round1(v.totalMin/v.cases):0,rb=idx%2===0?C.surface:C.surface2;return(<tr key={idx}><td style={{padding:"7px 12px",background:rb,color:C.text,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>Week of {wk}</td><td style={{padding:"7px 12px",background:rb,color:C.green,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{v.cases}</td><td style={{padding:"7px 12px",background:rb,color:C.blue,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(v.totalMin)}</td><td style={{padding:"7px 12px",background:rb,color:C.textMid,fontFamily:C.mono,fontSize:11,borderBottom:`1px solid ${C.border}`}}>{fmtMin(avg)}</td></tr>);})}</tbody>
+          </table>
+        </div>
+      </div>);
+    }
+
+    // ── ADMIN DASHBOARD ────────────────────────────────────────────────────────
+    function AdminDashboard({onLogout}){
+      const [reportRows,setReportRows]=useState(null),[ loading,setLoading]=useState(true),[ error,setError]=useState("");
+      const [view,setView]=useState("overview"),[ lastUpdate,setLastUpdate]=useState(null);
+      const load=useCallback(async()=>{
+        try{const rows=await apiFetchReport();setReportRows(rows);setLastUpdate(new Date());setError("");}
+        catch(e){setError("Failed to load. Check Apps Script deployment.");}
+        finally{setLoading(false);}
+      },[]);
+      useEffect(()=>{load();},[load]);
+      useEffect(()=>{const id=setInterval(()=>load(),60000);return()=>clearInterval(id);},[load]);
+      const parsed=reportRows?parseReportRows(reportRows):null;
+      const emps=parsed?Object.values(parsed.empMap).sort((a,b)=>b.totalCases-a.totalCases):[];
+      return(<div style={{minHeight:"100vh",background:C.bg,position:"relative"}}><GridBg/>
+        <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"10px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}><LxLogo size={36}/><div><div style={{fontFamily:C.display,fontWeight:800,fontSize:20,color:C.text}}>Admin Dashboard</div><div style={{fontFamily:C.mono,fontSize:10,color:C.textMid}}>{lastUpdate?`Updated ${lastUpdate.toLocaleTimeString("en-US")} · Auto-refresh 60s`:"Loading..."}</div></div></div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,background:C.surface2,border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 12px"}}><span style={{width:7,height:7,borderRadius:"50%",background:C.green,display:"inline-block",animation:"pulse-dot 2s infinite"}}/><span style={{fontFamily:C.mono,fontSize:11,color:C.green}}>Live</span></div>
+            <button onClick={onLogout} style={{background:C.surface2,border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 14px",fontFamily:C.mono,fontSize:11,color:C.textMid,cursor:"pointer"}}>← Exit Admin</button>
+          </div>
+        </div>
+        <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"0 24px",display:"flex",gap:4,overflowX:"auto"}}>
+          {[{id:"overview",label:"Overview"},...emps.map(e=>({id:e.email,label:e.name}))].map(tab=>(
+            <button key={tab.id} onClick={()=>setView(tab.id)} style={{padding:"10px 16px",background:"transparent",border:"none",borderBottom:`2px solid ${view===tab.id?C.blue:"transparent"}`,color:view===tab.id?C.blue:C.textMid,fontFamily:C.display,fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",transition:"all 0.15s"}}>{tab.label}</button>
+          ))}
+        </div>
+        <div style={{maxWidth:1200,margin:"0 auto",padding:"24px",position:"relative",zIndex:1}}>
+          {loading&&<div style={{textAlign:"center",padding:60,color:C.textMid,fontFamily:C.mono,fontSize:13}}><div style={{width:24,height:24,border:`2px solid ${C.border}`,borderTop:`2px solid ${C.blue}`,borderRadius:"50%",animation:"spin 1s linear infinite",margin:"0 auto 16px"}}/>Loading dashboard data...</div>}
+          {!loading&&error&&<div style={{background:"#2d0f0f",border:`1px solid ${C.red}`,borderRadius:10,padding:16,color:C.red,fontFamily:C.mono,fontSize:12}}>{error}</div>}
+          {!loading&&!error&&parsed&&(<>{view==="overview"&&<AdminOverview parsed={parsed}/>}{view!=="overview"&&parsed.empMap[view]&&<EmployeeDetail emp={parsed.empMap[view]} now={parsed.now}/>}</>)}
+        </div>
+      </div>);
+    }
+
+    // ── CASE CARD ──────────────────────────────────────────────────────────────
+    function CaseCard({caso,onAction,now,readonly}){
+      const ls=lastStatus(caso),isDone=ls===S.DONE,isPaused=ls===S.PAUSED,isActive=ls===S.STARTED||ls===S.RESUMED;
+      const pauses=pauseCount(caso),elapsed=computeElapsed(caso.events,now);
+      const [saving,setSaving]=useState(false);
+      const doAction=async(status)=>{setSaving(true);await onAction(caso,status);setSaving(false);};
+      const bc=isDone?C.border:isActive?C.borderActive:isPaused?"#7c5800":C.border;
+      const hasNotes=caso.notes&&String(caso.notes).trim().length>0;
+      return(<div style={{background:C.surface,border:`1px solid ${bc}`,borderLeft:`4px solid ${bc}`,borderRadius:12,padding:"16px 20px",animation:"fadeIn 0.3s ease",opacity:isDone?0.75:1}}>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+              <span style={{fontFamily:C.display,fontWeight:700,fontSize:17,color:C.text}}>{caso.caseName}</span>
+              {caso.urgent==="Si"&&<span>⚡</span>}
+              {isDone&&<span style={{fontFamily:C.mono,fontSize:10,color:C.textMid,marginLeft:"auto"}}>✓ COMPLETED</span>}
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",marginBottom:hasNotes?8:0}}>
+              <span style={{fontFamily:C.mono,fontSize:11,color:C.textMid}}>◎ {caso.processName}</span>
+              {isActive&&(<span style={{background:"#1a3d2a",color:C.green,fontFamily:C.mono,fontSize:11,padding:"2px 8px",borderRadius:20,display:"flex",alignItems:"center",gap:4}}><span style={{width:6,height:6,borderRadius:"50%",background:C.green,display:"inline-block",animation:"pulse-dot 1.5s infinite"}}/> Active</span>)}
+              {isPaused&&<span style={{fontFamily:C.mono,fontSize:11,color:"#ffd666"}}>⏸ On Hold</span>}
+              {isDone&&<><span style={{fontFamily:C.mono,fontSize:11,color:C.green}}>✓ Completed</span>{pauses>0&&<span style={{fontFamily:C.mono,fontSize:11,color:C.blue}}>{pauses} pause{pauses>1?"s":""}</span>}</>}
+              <span style={{fontFamily:C.mono,fontSize:11,color:isDone?C.textMid:isActive?C.blue:C.textMid,display:"flex",alignItems:"center",gap:4}}>{isActive&&<span style={{fontSize:10}}>🕐</span>}{isDone?`✓ ${formatElapsed(elapsed)} worked`:formatElapsed(elapsed)}</span>
+              {!isDone&&pauses>0&&<span style={{fontFamily:C.mono,fontSize:11,color:C.textMid}}>{pauses} pause{pauses>1?"s":""}</span>}
+            </div>
+            {hasNotes&&(<div style={{display:"flex",alignItems:"flex-start",gap:6,marginTop:6,background:"#1c2128",border:`1px solid ${C.border}`,borderRadius:6,padding:"6px 10px"}}><span style={{fontSize:11,flexShrink:0,marginTop:1}}>📝</span><span style={{fontFamily:C.mono,fontSize:11,color:C.textMid,lineHeight:1.5,wordBreak:"break-word"}}>{caso.notes}</span></div>)}
+          </div>
+          {!isDone&&!readonly&&(<div style={{display:"flex",gap:8,flexShrink:0,marginTop:2}}>
+            {isActive&&<button onClick={()=>doAction(S.PAUSED)} disabled={saving} style={{padding:"8px 18px",background:"#7c5800",color:"#ffd666",border:"1px solid #7c5800",borderRadius:8,fontFamily:C.display,fontWeight:700,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>⏸ Hold</button>}
+            {isPaused&&<button onClick={()=>doAction(S.RESUMED)} disabled={saving} style={{padding:"8px 18px",background:"#1a3d2a",color:C.green,border:`1px solid ${C.borderActive}`,borderRadius:8,fontFamily:C.display,fontWeight:700,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>↺ Resume</button>}
+            {(isActive||isPaused)&&<button onClick={()=>doAction(S.DONE)} disabled={saving} style={{padding:"8px 18px",background:"#5a1b1a",color:"#ff7b72",border:"1px solid #5a1b1a",borderRadius:8,fontFamily:C.display,fontWeight:700,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>✓ Done</button>}
+          </div>)}
+        </div>
+      </div>);
+    }
+
+    // ── HISTORY ────────────────────────────────────────────────────────────────
+    function HistoryTab({rows,now}){
+      const allCases=Object.values(groupRows(rows));
+      if(allCases.length===0)return(<div style={{textAlign:"center",padding:"48px 24px",background:C.surface,border:`1px dashed ${C.border}`,borderRadius:12,color:C.textDim,fontFamily:C.mono,fontSize:13}}><div style={{fontSize:32,marginBottom:12}}>🗂</div>No records yet.</div>);
+      const byDate={};
+      for(const c of allCases){const dk=c.dk||getDateKey(c.events[0].ts);if(!byDate[dk])byDate[dk]=[];byDate[dk].push(c);}
+      const todayDk=getDateKey(new Date().toISOString()),sortedDates=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+      return(<div><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,letterSpacing:"0.1em",marginBottom:16,borderBottom:`1px solid ${C.border}`,paddingBottom:8}}>MY HISTORY — LAST 30 DAYS</div>{sortedDates.map(dk=>{const sorted=sortCases(byDate[dk]),isCurrentDay=dk===todayDk;return(<div key={dk} style={{marginBottom:28}}><div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}><span style={{fontFamily:C.display,fontWeight:700,fontSize:14,color:isCurrentDay?C.blue:C.textMid,textTransform:"capitalize"}}>📅 {isCurrentDay?"Today — ":""}{friendlyDate(dk)}</span><span style={{fontFamily:C.mono,fontSize:10,color:C.textDim}}>{sorted.length} case{sorted.length>1?"s":""}</span></div><div style={{display:"flex",flexDirection:"column",gap:8}}>{sorted.map(c=><CaseCard key={c.key} caso={c} onAction={()=>{}} now={now} readonly={true}/>)}</div></div>);})}</div>);
+    }
+
+    // ── MAIN DASHBOARD ─────────────────────────────────────────────────────────
+    function Dashboard({user,onLogout,onAdmin}){
+      const [rows,setRows]=useState([]),[ loading,setLoading]=useState(true),[ connStatus,setConnStatus]=useState("connecting");
+      const [tab,setTab]=useState("active"),[ newCase,setNewCase]=useState(""),[ newProcess,setNewProcess]=useState("");
+      const [newNotes,setNewNotes]=useState(""),[ newUrgent,setNewUrgent]=useState(false),[ newState,setNewState]=useState(S.STARTED);
+      const [submitting,setSubmitting]=useState(false),[ formErr,setFormErr]=useState(""),[ now,setNow]=useState(Date.now());
+      const load=useCallback(async()=>{try{const data=await apiFetch(user);setRows(data);setConnStatus("ok");}catch{setConnStatus("error");}finally{setLoading(false);}},[ user]);
+      useEffect(()=>{load();},[load]);
+      useEffect(()=>{const id=setInterval(()=>load(),15000);return()=>clearInterval(id);},[load]);
+      useEffect(()=>{const id=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(id);},[]);
+      const todayRows=rows.filter(r=>isToday(r[0])),todayCases=sortCases(Object.values(groupRows(todayRows)));
+      const activeCases=todayCases.filter(c=>lastStatus(c)!==S.DONE),doneCases=todayCases.filter(c=>lastStatus(c)===S.DONE);
+
+      const handleAction=async(caso,newSt)=>{
+        const ts=new Date().toISOString();
+        const row=[ts,user,caso.caseName,caso.processName,newSt,caso.urgent,caso.notes||"",caso.key];
+        setRows(prev=>[...prev,row]); // optimistic update — shows immediately
+        await apiAppend(row);         // fire and forget to sheet
+        // reload after 3s to confirm
+        setTimeout(()=>load(),3000);
+      };
+
+      const handleSubmit=async()=>{
+        if(!newCase.trim()){setFormErr("Case name is required");return;}
+        if(!newProcess.trim()){setFormErr("Process name is required");return;}
+        setFormErr("");setSubmitting(true);
+        const ts=new Date().toISOString(),codigo=makeCode();
+        const row=[ts,user,newCase.trim(),newProcess.trim(),newState,newUrgent?"Si":"No",newNotes.trim(),codigo];
+        setRows(prev=>[...prev,row]); // show immediately
+        await apiAppend(row);          // send to sheet
+        setNewCase("");setNewProcess("");setNewNotes("");setNewUrgent(false);setNewState(S.STARTED);
+        setSubmitting(false);
+        // reload after 3s to confirm from sheet
+        setTimeout(()=>load(),3000);
+      };
+
+      const dateStr=new Date().toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+      const connLabel=connStatus==="ok"?"Online":connStatus==="error"?"Error":"Connecting...";
+      const connColor=connStatus==="ok"?C.green:connStatus==="error"?C.red:C.yellow;
+      return(<div style={{minHeight:"100vh",background:C.bg,fontFamily:"'Barlow',sans-serif",position:"relative"}}><GridBg/>
+        <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"10px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}><LxLogo size={38}/><div><div style={{fontFamily:C.display,fontWeight:800,fontSize:22,color:C.text,lineHeight:1}}>Case Tracker</div><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,marginTop:2}}>{dateStr}</div></div></div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <button onClick={onAdmin} style={{background:"transparent",border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 14px",fontFamily:C.mono,fontSize:11,color:C.textMid,cursor:"pointer",display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:12}}>🔐</span> Admin</button>
+            <div style={{display:"flex",alignItems:"center",gap:6,background:C.surface2,border:`1px solid ${connStatus==="error"?C.red:C.border}`,borderRadius:20,padding:"4px 12px"}}><span style={{width:7,height:7,borderRadius:"50%",display:"inline-block",background:connColor,animation:connStatus==="ok"?"pulse-dot 2s infinite":"none"}}/><span style={{fontFamily:C.mono,fontSize:11,color:connColor}}>{connLabel}</span></div>
+            <div style={{background:C.surface2,border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 14px",fontFamily:C.mono,fontSize:12,color:C.textMid,display:"flex",alignItems:"center",gap:8}}>{user}<button onClick={onLogout} style={{background:"none",border:"none",color:C.textMid,cursor:"pointer",fontFamily:C.mono,fontSize:11,padding:"0 0 0 4px"}}>sign out</button></div>
+          </div>
+        </div>
+        <div style={{maxWidth:1100,margin:"0 auto",padding:"24px",position:"relative",zIndex:1}}>
+          <div style={{display:"flex",gap:8,marginBottom:24}}>
+            {[["active","Active Cases"],["history","My History"]].map(([key,label])=>(<button key={key} onClick={()=>setTab(key)} style={{padding:"8px 20px",borderRadius:20,border:`1px solid ${tab===key?C.blue:C.border}`,background:tab===key?C.blue:"transparent",color:tab===key?"#0d1117":C.textMid,fontFamily:C.display,fontWeight:700,fontSize:15,cursor:"pointer",transition:"all 0.15s"}}>{label}</button>))}
+          </div>
+          {tab==="active"&&(<>
+            <div style={{marginBottom:32}}>
+              <div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,letterSpacing:"0.1em",marginBottom:12,borderBottom:`1px solid ${C.border}`,paddingBottom:8}}>LOG NEW TASK</div>
+              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"20px 24px"}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+                  <div><label style={{fontFamily:C.mono,fontSize:10,color:C.textMid,display:"block",marginBottom:6,letterSpacing:"0.08em"}}>CASE NAME *</label><input value={newCase} onChange={e=>setNewCase(e.target.value)} placeholder="Case / client name" style={{width:"100%",background:C.surface2,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px",color:C.text,fontSize:14}} onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.border}/></div>
+                  <div><label style={{fontFamily:C.mono,fontSize:10,color:C.textMid,display:"block",marginBottom:6,letterSpacing:"0.08em"}}>PROCESS NAME *</label><input value={newProcess} onChange={e=>setNewProcess(e.target.value)} placeholder="e.g. Scrub, UCC, NOD Draft..." style={{width:"100%",background:C.surface2,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px",color:C.text,fontSize:14}} onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.border}/></div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+                  <div><label style={{fontFamily:C.mono,fontSize:10,color:C.textMid,display:"block",marginBottom:6,letterSpacing:"0.08em"}}>STATUS</label><select value={newState} onChange={e=>setNewState(e.target.value)} style={{width:"100%",background:C.surface2,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px",color:C.text,fontSize:14,appearance:"none",cursor:"pointer"}}><option value={S.STARTED}>▶ On this — Starting</option><option value={S.PAUSED}>⏸ On Hold — Pause</option><option value={S.RESUMED}>↺ Resuming — Resume</option><option value={S.DONE}>✓ Done, Completed — Finish</option></select></div>
+                  <div><label style={{fontFamily:C.mono,fontSize:10,color:C.textMid,display:"block",marginBottom:6,letterSpacing:"0.08em"}}>ADDITIONAL NOTES</label><div style={{display:"flex",gap:8,alignItems:"center"}}><input value={newNotes} onChange={e=>setNewNotes(e.target.value)} placeholder="Optional..." style={{flex:1,background:C.surface2,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px",color:C.text,fontSize:14}} onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.border}/><div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",flexShrink:0}} onClick={()=>setNewUrgent(v=>!v)}><div style={{width:18,height:18,borderRadius:4,border:`2px solid ${newUrgent?C.yellow:C.border}`,background:newUrgent?"#7c5800":"transparent",display:"flex",alignItems:"center",justifyContent:"center"}}>{newUrgent&&<span style={{color:"#ffd666",fontSize:11}}>✓</span>}</div><span style={{fontFamily:C.display,fontWeight:700,fontSize:14,color:newUrgent?"#ffd666":C.textMid}}>⚡ Urgent</span></div></div></div>
+                </div>
+                {formErr&&<p style={{color:C.red,fontFamily:C.mono,fontSize:11,marginBottom:10}}>{formErr}</p>}
+                <button onClick={handleSubmit} disabled={submitting} style={{padding:"10px 22px",background:submitting?C.surface2:C.blue,color:submitting?C.textMid:"#0d1117",border:"none",borderRadius:8,fontFamily:C.display,fontWeight:700,fontSize:15,cursor:submitting?"not-allowed":"pointer"}}>{submitting?"Saving...":"+ Log Task"}</button>
+              </div>
+            </div>
+            {loading?(<div style={{textAlign:"center",padding:40,color:C.textMid,fontFamily:C.mono,fontSize:13}}>Loading data...</div>):(<>
+              {activeCases.length>0&&(<div style={{marginBottom:28}}><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,letterSpacing:"0.1em",marginBottom:12,borderBottom:`1px solid ${C.border}`,paddingBottom:8,display:"flex",justifyContent:"space-between"}}><span>IN PROGRESS</span><span style={{color:C.green}}>{activeCases.length} active</span></div><div style={{display:"flex",flexDirection:"column",gap:10}}>{activeCases.map(c=><CaseCard key={c.key} caso={c} onAction={handleAction} now={now}/>)}</div></div>)}
+              {doneCases.length>0&&(<div><div style={{fontFamily:C.mono,fontSize:11,color:C.textMid,letterSpacing:"0.1em",marginBottom:12,borderBottom:`1px solid ${C.border}`,paddingBottom:8,display:"flex",justifyContent:"space-between"}}><span>COMPLETED TODAY</span><span>{doneCases.length} case{doneCases.length>1?"s":""}</span></div><div style={{display:"flex",flexDirection:"column",gap:10}}>{doneCases.map(c=><CaseCard key={c.key} caso={c} onAction={handleAction} now={now}/>)}</div></div>)}
+              {activeCases.length===0&&doneCases.length===0&&(<div style={{textAlign:"center",padding:"48px 24px",background:C.surface,border:`1px dashed ${C.border}`,borderRadius:12,color:C.textDim,fontFamily:C.mono,fontSize:13}}><div style={{fontSize:32,marginBottom:12}}>📋</div>No tasks logged today.<br/>Use the form above to log a new one.</div>)}
+            </>)}
+          </>)}
+          {tab==="history"&&(loading?<div style={{textAlign:"center",padding:40,color:C.textMid,fontFamily:C.mono,fontSize:13}}>Loading history...</div>:<HistoryTab rows={rows} now={now}/>)}
+        </div>
+      </div>);
+    }
+
+    // ── LOGIN ──────────────────────────────────────────────────────────────────
+    function LoginScreen({onLogin}){
+      const [val,setVal]=useState(""),[ err,setErr]=useState(""),[ loading,setLoading]=useState(false);
+      const submit=async()=>{if(!val.trim()){setErr("Enter your email or username");return;}setLoading(true);await delay(300);onLogin(val.trim().toLowerCase());setLoading(false);};
+      return(<div style={{minHeight:"100vh",background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-start",padding:"48px 16px",position:"relative"}}><GridBg/><div style={{display:"flex",alignItems:"center",gap:18,marginBottom:24,zIndex:1}}><LxLogo size={72}/><div><h1 style={{fontFamily:C.display,fontWeight:800,fontSize:42,color:C.text,letterSpacing:"-0.5px",lineHeight:1.1}}>Lexington Recovery</h1><p style={{fontFamily:C.mono,fontSize:13,color:C.textMid,marginTop:4}}>Case Tracking & Management</p></div></div><div style={{width:"100%",maxWidth:560,height:1,background:C.border,marginBottom:32,zIndex:1}}/><div style={{width:"100%",maxWidth:560,background:C.surface,border:`1px solid ${C.border}`,borderRadius:16,padding:"36px 32px",zIndex:1,animation:"fadeIn 0.4s ease"}}><h2 style={{fontFamily:C.display,fontWeight:800,fontSize:38,color:C.text,marginBottom:8}}>Sign In</h2><p style={{fontFamily:C.mono,fontSize:13,color:C.textMid,marginBottom:28}}>Enter your email or name to continue</p><label style={{fontFamily:C.mono,fontSize:11,color:C.textMid,letterSpacing:"0.08em",display:"block",marginBottom:8}}>EMAIL OR USERNAME</label><input value={val} onChange={e=>setVal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="e.g. ana@lexingtonrecovery.com" style={{width:"100%",background:C.surface2,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px 16px",color:C.text,fontSize:15,marginBottom:err?8:20}} onFocus={e=>e.target.style.borderColor=C.blue} onBlur={e=>e.target.style.borderColor=C.border}/>{err&&<p style={{color:C.red,fontSize:12,fontFamily:C.mono,marginBottom:12}}>{err}</p>}<button onClick={submit} disabled={loading} style={{width:"100%",padding:"16px",background:loading?C.surface2:C.blue,color:loading?C.textMid:"#0d1117",border:"none",borderRadius:10,fontSize:16,fontWeight:700,fontFamily:C.display,cursor:loading?"not-allowed":"pointer"}}>{loading?"Connecting...":"Sign In →"}</button></div></div>);
+    }
+
+    // ── ROOT ───────────────────────────────────────────────────────────────────
+    function App(){
+      const [screen,setScreen]=useState("login"),[ user,setUser]=useState(null);
+      return(<>
+        {screen==="login"&&<LoginScreen onLogin={u=>{setUser(u);setScreen("app");}}/>}
+        {screen==="app"&&<Dashboard user={user} onLogout={()=>{setUser(null);setScreen("login");}} onAdmin={()=>setScreen("adminLogin")}/>}
+        {screen==="adminLogin"&&<AdminLogin onSuccess={()=>setScreen("admin")} onBack={()=>setScreen(user?"app":"login")}/>}
+        {screen==="admin"&&<AdminDashboard onLogout={()=>setScreen(user?"app":"login")}/>}
+      </>);
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
