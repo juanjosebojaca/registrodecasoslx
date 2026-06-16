@@ -1,0 +1,1035 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lexington Recovery — Case Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #0d1117; font-family: 'Barlow', sans-serif; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    input, select, button, textarea { font-family: inherit; }
+    input:focus, select:focus, textarea:focus { outline: none; }
+    @keyframes pulse-dot  { 0%,100%{opacity:1} 50%{opacity:.3} }
+    @keyframes fadeIn     { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes spin       { to { transform: rotate(360deg); } }
+    @keyframes slideDown  { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes alertPulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+  </style>
+</head>
+<body>
+  <iframe id="append-frame" name="append-frame" style="display:none;" title="bg"></iframe>
+  <div id="root"></div>
+    <script>
+    window.addEventListener("error", function(event) {
+      var root = document.getElementById("root");
+      if (root && !root.childElementCount) {
+        root.innerHTML = '<div style="min-height:100vh;background:#0d1117;color:#e6edf3;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px"><div style="max-width:720px;border:1px solid #da3633;border-radius:12px;padding:24px;background:#161b22"><h1 style="margin:0 0 12px;font-size:22px">Case Tracker no pudo cargar</h1><p style="color:#8b949e;line-height:1.5">Ocurrió un error de JavaScript antes de iniciar la app. Revisa la consola del navegador o restaura el backup estable.</p><pre style="white-space:pre-wrap;color:#ff7b72">' + String(event.message || 'Unknown error').replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }) + '</pre></div></div>';
+      }
+    });
+    window.addEventListener("unhandledrejection", function(event) {
+      console.error("Unhandled promise rejection:", event.reason);
+    });
+  </script>
+  <script>
+const { useState, useEffect, useCallback, useRef } = React;
+// ── CONFIG ─────────────────────────────────────────────────────────────────
+// ⚠️ UPDATE THIS URL AFTER EVERY NEW APPS SCRIPT DEPLOY
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwXwaqJQDK7VwxrVA4BCNdG-HDu_HU-6IlJOr1QUE5fAi7sHZWVEp-tUVUZWfnLcckh/exec";
+const ADMIN_PIN = "1219";
+const FORGOTTEN_MIN = 60; // minutes without activity before showing forgotten alert
+const S = { STARTED: "On this", PAUSED: "On Hold", RESUMED: "Resuming", DONE: "Done, Completed" };
+const C = {
+    bg: "#0d1117", surface: "#161b22", surface2: "#21262d", border: "#30363d", borderActive: "#238636",
+    blue: "#4d9cf8", green: "#3fb950", yellow: "#d29922", red: "#da3633",
+    text: "#e6edf3", textMid: "#8b949e", textDim: "#484f58",
+    mono: "'IBM Plex Mono', monospace", display: "'Barlow Condensed', sans-serif",
+};
+// ── MAINTENANCE MODE — stored in module-level var, set by admin ────────────
+// Using a simple ref-like object so it survives re-renders without context
+const MAINT = { active: false };
+// ── UTILS ──────────────────────────────────────────────────────────────────
+function makeCode() { return `${Date.now()}${Math.floor(Math.random() * 900000) + 100000}`; }
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+function isToday(ts) { const d = new Date(ts), n = new Date(); return d.getDate() === n.getDate() && d.getMonth() === n.getMonth() && d.getFullYear() === n.getFullYear(); }
+function getDateKey(ts) { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function getWeekKey(d) { const m = new Date(d); m.setDate(d.getDate() - d.getDay() + 1); return getDateKey(m); }
+function getMonthKey(d) { return `${d.getFullYear()}-${d.getMonth()}`; }
+function friendlyDate(dk) { return new Date(dk + "T12:00:00").toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "long", year: "numeric" }); }
+function fmtMin(min) { if (!min || min < 0)
+    return "0m"; const h = Math.floor(min / 60), m = Math.round(min % 60); return h > 0 ? `${h}h ${m}m` : `${m}m`; }
+function formatElapsed(ms) { if (!ms || ms < 0)
+    return "0s"; const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60; if (h > 0)
+    return `${h}h ${m}m`; if (m > 0)
+    return `${m}m ${sec}s`; return `${sec}s`; }
+function isWeekday(d) { const dow = new Date(d).getDay(); return dow !== 0 && dow !== 6; }
+function round1(n) { return Math.round(n * 10) / 10; }
+function shortDate(ts) { const d = new Date(ts); return d.toLocaleDateString("en-US", { month: "short", day: "numeric" }); }
+function timeAgo(ts) {
+    const ms = Date.now() - new Date(ts).getTime();
+    if (ms < 0)
+        return "just now";
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60)
+        return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60)
+        return `${min}m ago`;
+    const hrs = Math.floor(min / 60);
+    if (hrs < 24)
+        return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+}
+function similarity(a, b) {
+    a = a.toLowerCase().trim();
+    b = b.toLowerCase().trim();
+    const m = a.length, n = b.length;
+    if (m === 0 || n === 0)
+        return m === n ? 1 : 0;
+    const dp = Array.from({ length: m + 1 }, (_, i) => Array.from({ length: n + 1 }, (_, j) => i === 0 ? j : j === 0 ? i : 0));
+    for (let i = 1; i <= m; i++)
+        for (let j = 1; j <= n; j++)
+            dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    return 1 - dp[m][n] / Math.max(m, n);
+}
+function groupProcessNames(names) {
+    const T = 0.65, groups = [], assigned = {};
+    names.forEach(name => {
+        if (assigned[name] !== undefined)
+            return;
+        let found = false;
+        for (const g of groups) {
+            if (similarity(name, g.canonical) >= T) {
+                g.members.push(name);
+                assigned[name] = g.canonical;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            groups.push({ canonical: name, members: [name] });
+            assigned[name] = name;
+        }
+    });
+    return assigned;
+}
+function computeElapsed(events, now = Date.now()) {
+    let total = 0, lastStart = null;
+    for (const e of events) {
+        const t = new Date(e.ts).getTime();
+        if (e.status === S.STARTED || e.status === S.RESUMED) {
+            lastStart = t;
+        }
+        else if ((e.status === S.PAUSED || e.status === S.DONE) && lastStart !== null) {
+            total += t - lastStart;
+            lastStart = null;
+        }
+    }
+    if (lastStart !== null)
+        total += now - lastStart;
+    return total;
+}
+function groupRows(rows) {
+    const map = {};
+    for (const r of rows) {
+        const [ts, , caseName, processName, status, urgent, notes, codigoUnico] = r;
+        const dk = getDateKey(ts);
+        const key = (codigoUnico && String(codigoUnico).trim()) ? String(codigoUnico).trim() : `${caseName}__${dk}`;
+        if (!map[key])
+            map[key] = { key, caseName, processName, urgent: "No", notes: "", events: [], dk };
+        map[key].events.push({ ts, status, urgent, notes });
+        if (urgent === "Si")
+            map[key].urgent = "Si";
+        if (notes && String(notes).trim())
+            map[key].notes = String(notes).trim();
+        map[key].processName = processName;
+    }
+    for (const k of Object.keys(map))
+        map[k].events.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+    return map;
+}
+function lastStatus(caso) { const ev = caso.events; return ev.length ? ev[ev.length - 1].status : null; }
+function pauseCount(caso) { return caso.events.filter(e => e.status === S.PAUSED).length; }
+function sortCases(cases) {
+    const rank = s => s === S.STARTED || s === S.RESUMED ? 0 : s === S.PAUSED ? 1 : 2;
+    return [...cases].sort((a, b) => { const ra = rank(lastStatus(a)), rb = rank(lastStatus(b)); if (ra !== rb)
+        return ra - rb; return new Date(a.events[0].ts) - new Date(b.events[0].ts); });
+}
+// ── API ────────────────────────────────────────────────────────────────────
+function apiAppend(row) {
+    const img = new Image();
+    img.src = `${APPS_SCRIPT_URL}?action=append&row=${encodeURIComponent(JSON.stringify(row))}`;
+    return Promise.resolve({ success: true });
+}
+async function apiFetch(email) {
+    const since = new Date();
+    since.setDate(since.getDate() - 30);
+    const url = `${APPS_SCRIPT_URL}?action=getByEmail&email=${encodeURIComponent(email)}&sheetName=Eventos&since=${encodeURIComponent(since.toISOString())}`;
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok)
+        throw new Error("Failed");
+    const d = await res.json();
+    return d.rows || [];
+}
+async function apiFetchReport() {
+    const res = await fetch(`${APPS_SCRIPT_URL}?action=getReport`, { redirect: "follow" });
+    if (!res.ok)
+        throw new Error("Failed");
+    const d = await res.json();
+    return d.rows || [];
+}
+// ── REPORT PARSER ──────────────────────────────────────────────────────────
+function parseReportRows(rows) {
+    const allProcNames = [];
+    rows.forEach(r => { const p = String(r[2]).trim(); if (p && !allProcNames.includes(p))
+        allProcNames.push(p); });
+    const pgm = groupProcessNames(allProcNames);
+    const now = new Date(), empMap = {}, procMap = {};
+    const ago30 = new Date();
+    ago30.setDate(ago30.getDate() - 30);
+    rows.forEach(row => {
+        const uid = String(row[0]).trim(), caseName = String(row[1]).trim();
+        const email = String(row[3]).trim(), startR = row[4], endR = row[5];
+        const urgent = String(row[6] || "").trim(), notes = String(row[7] || "").trim();
+        const procR = String(row[2]).trim(), timeMin = parseFloat(row[18]) || 0;
+        const autoClosed = notes.indexOf("[Auto-closed at 6PM]") >= 0;
+        if (!startR || !endR)
+            return;
+        const startD = startR instanceof Date ? startR : new Date(startR);
+        if (isNaN(startD) || !isWeekday(startD))
+            return;
+        const proc = pgm[procR] || procR, dk = getDateKey(startD), wk = getWeekKey(startD), mk = getMonthKey(startD);
+        if (!empMap[email])
+            empMap[email] = {
+                email, name: email.split("@")[0],
+                byDay: {}, byWeek: {}, byMonth: {},
+                totalMin: 0, totalCases: 0, byProcess: {},
+                autoClosed: 0, allCaseDetails: [],
+                lastEventTs: null
+            };
+        const e = empMap[email];
+        e.totalMin += timeMin;
+        e.totalCases += 1;
+        const endD = endR instanceof Date ? endR : new Date(endR);
+        if (!e.lastEventTs || endD > new Date(e.lastEventTs))
+            e.lastEventTs = endD.toISOString();
+        const inLast30 = startD >= ago30;
+        // store dk so we can look up cases by day in the breakdown
+        e.allCaseDetails.push({ caseName, processName: proc, timeMin, urgent, notes, autoClosed, startD, inLast30, dk });
+        if (autoClosed)
+            e.autoClosed += 1;
+        if (!e.byDay[dk])
+            e.byDay[dk] = { cases: 0, totalMin: 0 };
+        if (!e.byWeek[wk])
+            e.byWeek[wk] = { cases: 0, totalMin: 0 };
+        if (!e.byMonth[mk])
+            e.byMonth[mk] = { cases: 0, totalMin: 0 };
+        if (!e.byProcess[proc])
+            e.byProcess[proc] = { cases: 0, totalMin: 0 };
+        e.byDay[dk].cases++;
+        e.byDay[dk].totalMin += timeMin;
+        e.byWeek[wk].cases++;
+        e.byWeek[wk].totalMin += timeMin;
+        e.byMonth[mk].cases++;
+        e.byMonth[mk].totalMin += timeMin;
+        e.byProcess[proc].cases++;
+        e.byProcess[proc].totalMin += timeMin;
+        if (!procMap[proc])
+            procMap[proc] = { cases: 0, totalMin: 0 };
+        procMap[proc].cases++;
+        procMap[proc].totalMin += timeMin;
+    });
+    return { empMap, procMap, now };
+}
+// ── SHARED COMPONENTS ──────────────────────────────────────────────────────
+const GridBg = () => (React.createElement("div", { style: { position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0, backgroundImage: `linear-gradient(rgba(48,54,61,0.25) 1px,transparent 1px),linear-gradient(90deg,rgba(48,54,61,0.25) 1px,transparent 1px)`, backgroundSize: "40px 40px" } }));
+const LxLogo = ({ size = 48 }) => (React.createElement("div", { style: { width: size, height: size, borderRadius: size * 0.22, background: "linear-gradient(135deg,#4d9cf8 0%,#1a5ccf 100%)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 } },
+    React.createElement("span", { style: { fontFamily: C.display, fontWeight: 800, fontSize: size * 0.38, color: "#0d1117" } }, "LX")));
+// ── FEAT 6: FOOTER ─────────────────────────────────────────────────────────
+const Footer = () => (React.createElement("div", { style: { textAlign: "center", padding: "20px 24px 12px", fontFamily: C.mono, fontSize: 10, color: C.textDim, borderTop: `1px solid ${C.border}`, marginTop: 32 } }, "Lexington Case Tracker \u2013 Built and maintained by Juan Jos\u00E9 Bojac\u00E1, Lexington Recovery and Amsterdam Capital Group Supervisor"));
+// ── FEAT 5: MAINTENANCE BANNER ─────────────────────────────────────────────
+function MaintenanceBanner() {
+    return (React.createElement("div", { style: { background: "#1c1000", border: `1px solid ${C.yellow}`, borderRadius: 0, padding: "10px 24px", display: "flex", alignItems: "center", gap: 10, position: "sticky", top: 0, zIndex: 200 } },
+        React.createElement("span", { style: { fontSize: 16 } }, "\uD83D\uDD27"),
+        React.createElement("span", { style: { fontFamily: C.mono, fontSize: 12, color: C.yellow, fontWeight: 600 } }, "System under maintenance. Please wait.")));
+}
+function StatCard({ label, value, sub, color, onClick, active }) {
+    return (React.createElement("div", { onClick: onClick, style: { background: C.surface, border: `1px solid ${active ? color || C.blue : C.border}`, borderRadius: 10, padding: "14px 16px", cursor: onClick ? "pointer" : "default", transition: "border-color 0.2s" } },
+        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.08em", marginBottom: 6 } }, label),
+        React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 22, color: color || C.text } }, value),
+        sub && React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, marginTop: 3 } }, sub)));
+}
+function BarChart({ labels, datasets, height = 180 }) {
+    const ref = useRef(null), chartRef = useRef(null);
+    useEffect(() => {
+        if (!ref.current)
+            return;
+        if (chartRef.current)
+            chartRef.current.destroy();
+        chartRef.current = new Chart(ref.current, { type: "bar", data: { labels, datasets: datasets.map(d => (Object.assign(Object.assign({}, d), { borderRadius: 4, borderSkipped: false }))) }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: C.textMid, font: { size: 9 } }, grid: { color: "#21262d" } }, y: { ticks: { color: C.textMid, font: { size: 9 } }, grid: { color: "#21262d" }, beginAtZero: true } } } });
+        return () => { if (chartRef.current)
+            chartRef.current.destroy(); };
+    }, [JSON.stringify({ labels, datasets })]);
+    return React.createElement("div", { style: { position: "relative", height } },
+        React.createElement("canvas", { ref: ref }));
+}
+function DoughnutChart({ labels, data, colors, height = 180 }) {
+    const ref = useRef(null), chartRef = useRef(null);
+    useEffect(() => {
+        if (!ref.current)
+            return;
+        if (chartRef.current)
+            chartRef.current.destroy();
+        chartRef.current = new Chart(ref.current, { type: "doughnut", data: { labels, datasets: [{ data, backgroundColor: colors, borderColor: C.bg, borderWidth: 2 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: "65%" } });
+        return () => { if (chartRef.current)
+            chartRef.current.destroy(); };
+    }, [JSON.stringify({ labels, data, colors })]);
+    return React.createElement("div", { style: { position: "relative", height } },
+        React.createElement("canvas", { ref: ref }));
+}
+// ── FORGOTTEN CASES ALERT ──────────────────────────────────────────────────
+function ForgottenCasesAlert({ cases, now }) {
+    const forgotten = cases.filter(c => {
+        const ls = lastStatus(c);
+        if (ls === S.DONE)
+            return false;
+        const lastEv = c.events[c.events.length - 1];
+        return (now - new Date(lastEv.ts).getTime()) / 60000 >= FORGOTTEN_MIN;
+    });
+    if (forgotten.length === 0)
+        return null;
+    return (React.createElement("div", { style: { background: "#1a0d0d", border: `1px solid ${C.red}`, borderLeft: `4px solid ${C.red}`, borderRadius: 10, padding: "12px 16px", marginBottom: 20, animation: "alertPulse 3s ease infinite" } },
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 } },
+            React.createElement("span", { style: { fontSize: 14 } }, "\uD83D\uDEA8"),
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.red, fontWeight: 600, letterSpacing: "0.08em" } },
+                forgotten.length,
+                " OPEN CASE",
+                forgotten.length > 1 ? "S" : "",
+                " WITH NO ACTIVITY")),
+        React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 5 } }, forgotten.map((c, i) => {
+            const lastEv = c.events[c.events.length - 1];
+            const ls = lastStatus(c);
+            return (React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+                React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 13, color: C.text } }, c.caseName),
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid } },
+                    "\u25CE ",
+                    c.processName),
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: ls === S.PAUSED ? "#ffd666" : C.textMid } }, ls === S.PAUSED ? "on hold" : "active"),
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.red, marginLeft: "auto" } }, timeAgo(lastEv.ts))));
+        }))));
+}
+// ── ACTIVITY STATUS (for admin view) ──────────────────────────────────────
+function getActivityStatus(emp, now) {
+    if (!emp.lastEventTs)
+        return { status: "inactive", label: "No data", color: C.textDim };
+    const min = (now - new Date(emp.lastEventTs).getTime()) / 60000;
+    if (min < 30)
+        return { status: "active", label: "Active", color: C.green };
+    if (min < 180)
+        return { status: "recent", label: "Recent", color: C.yellow };
+    return { status: "inactive", label: "Inactive", color: C.textDim };
+}
+function ActivityBadge({ status, label, color }) {
+    return (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5 } },
+        React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: color, display: "inline-block", animation: status === "active" ? "pulse-dot 1.5s infinite" : "none", flexShrink: 0 } }),
+        React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color } }, label)));
+}
+// ── FEAT 3: MY STATUS WIDGET (employee own status) ─────────────────────────
+// Computes activity from the user's own rows (last 30 days fetched data)
+function MyStatusWidget({ rows }) {
+    const [now, setNow] = useState(Date.now());
+    useEffect(() => { const id = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(id); }, []);
+    if (!rows || rows.length === 0)
+        return null;
+    // find most recent event timestamp from user's own rows
+    const lastTs = rows.reduce((max, r) => { const t = new Date(r[0]).getTime(); return t > max ? t : max; }, 0);
+    if (!lastTs)
+        return null;
+    const min = (now - lastTs) / 60000;
+    let status, label, color, dot;
+    if (min < 30) {
+        status = "active";
+        label = "Active";
+        color = C.green;
+        dot = true;
+    }
+    else if (min < 180) {
+        status = "recent";
+        label = "Recent";
+        color = C.yellow;
+        dot = false;
+    }
+    else {
+        status = "inactive";
+        label = "Inactive";
+        color = C.textDim;
+        dot = false;
+    }
+    return (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 20, fontSize: 11 } },
+        React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: color, display: "inline-block", animation: dot ? "pulse-dot 1.5s infinite" : "none", flexShrink: 0 } }),
+        React.createElement("span", { style: { fontFamily: C.mono, color, fontWeight: 600 } },
+            status === "active" ? "🟢" : status === "recent" ? "🟡" : "⚫",
+            " ",
+            label),
+        React.createElement("span", { style: { fontFamily: C.mono, color: C.textDim } }, "\u00B7"),
+        React.createElement("span", { style: { fontFamily: C.mono, color: C.textMid } },
+            "Last activity: ",
+            timeAgo(lastTs))));
+}
+// ── ADMIN PIN ──────────────────────────────────────────────────────────────
+function AdminLogin({ onSuccess, onBack }) {
+    const [pin, setPin] = useState(""), [err, setErr] = useState(""), [shake, setShake] = useState(false);
+    const press = (d) => {
+        if (pin.length >= 4)
+            return;
+        const next = pin + d;
+        setPin(next);
+        if (next.length === 4) {
+            if (next === ADMIN_PIN) {
+                onSuccess();
+            }
+            else {
+                setErr("Incorrect PIN");
+                setShake(true);
+                setTimeout(() => { setPin(""); setShake(false); setErr(""); }, 700);
+            }
+        }
+    };
+    const digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "⌫"];
+    return (React.createElement("div", { style: { minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" } },
+        React.createElement(GridBg, null),
+        React.createElement("div", { style: { zIndex: 1, width: "100%", maxWidth: 340, animation: "fadeIn 0.3s ease" } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 32, justifyContent: "center" } },
+                React.createElement(LxLogo, { size: 44 }),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 22, color: C.text } }, "Admin Access"),
+                    React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid } }, "Enter 4-digit PIN"))),
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${shake ? C.red : C.border}`, borderRadius: 16, padding: "28px 24px", transition: "border-color 0.2s" } },
+                React.createElement("div", { style: { display: "flex", gap: 12, justifyContent: "center", marginBottom: 24 } }, [0, 1, 2, 3].map(i => (React.createElement("div", { key: i, style: { width: 14, height: 14, borderRadius: "50%", background: pin.length > i ? C.blue : C.surface2, border: `2px solid ${pin.length > i ? C.blue : C.border}`, transition: "all 0.15s" } })))),
+                err && React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.red, textAlign: "center", marginBottom: 16 } }, err),
+                React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10 } }, digits.map((d, i) => (React.createElement("button", { key: i, onClick: () => d === "⌫" ? setPin(p => p.slice(0, -1)) : d ? press(d) : null, style: { padding: "16px", background: d ? C.surface2 : "transparent", border: `1px solid ${d ? C.border : "transparent"}`, borderRadius: 10, color: d === "⌫" ? C.textMid : C.text, fontSize: d === "⌫" ? 18 : 20, fontWeight: 700, cursor: d ? "pointer" : "default", fontFamily: C.display, transition: "background 0.1s" } }, d))))),
+            React.createElement("button", { onClick: onBack, style: { width: "100%", marginTop: 16, padding: "10px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 10, color: C.textMid, fontFamily: C.mono, fontSize: 12, cursor: "pointer" } }, "\u2190 Back to App"))));
+}
+// ── ADMIN OVERVIEW ─────────────────────────────────────────────────────────
+function AdminOverview({ parsed }) {
+    const { empMap, procMap, now } = parsed;
+    const emps = Object.values(empMap).sort((a, b) => b.totalCases - a.totalCases);
+    const todayK = getDateKey(now), weekK = getWeekKey(now), monthK = getMonthKey(now);
+    const totalToday = emps.reduce((s, e) => s + (e.byDay[todayK] ? e.byDay[todayK].cases : 0), 0);
+    const totalWeek = emps.reduce((s, e) => s + (e.byWeek[weekK] ? e.byWeek[weekK].cases : 0), 0);
+    const totalMonth = emps.reduce((s, e) => s + (e.byMonth[monthK] ? e.byMonth[monthK].cases : 0), 0);
+    const allTimes = emps.flatMap(e => e.allCaseDetails.map(c => c.timeMin));
+    const avgTime = allTimes.length > 0 ? round1(allTimes.reduce((a, b) => a + b, 0) / allTimes.length) : 0;
+    const topProcs = Object.entries(procMap).map(([p, v]) => ({ p, cases: v.cases, avg: v.cases > 0 ? round1(v.totalMin / v.cases) : 0 })).sort((a, b) => b.avg - a.avg).slice(0, 5);
+    const allProcs = Object.entries(procMap).sort((a, b) => b[1].cases - a[1].cases).slice(0, 8).map(e => e[0]);
+    const palette = ["#4d9cf8", "#3fb950", "#d29922", "#da3633", "#a371f7", "#f78166", "#ffa657", "#79c0ff"];
+    return (React.createElement("div", null,
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 } },
+            React.createElement(StatCard, { label: "CASES TODAY", value: totalToday, sub: "all employees", color: C.green }),
+            React.createElement(StatCard, { label: "CASES THIS WEEK", value: totalWeek, sub: "weekdays only", color: C.blue }),
+            React.createElement(StatCard, { label: "CASES THIS MONTH", value: totalMonth, color: C.text }),
+            React.createElement(StatCard, { label: "AVG TIME / CASE", value: fmtMin(avgTime), sub: "all employees", color: C.yellow })),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 16, marginBottom: 24 } },
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "CASES THIS WEEK BY EMPLOYEE"),
+                React.createElement(BarChart, { labels: emps.map(e => e.name), datasets: [{ label: "Cases", data: emps.map(e => e.byWeek[weekK] ? e.byWeek[weekK].cases : 0), backgroundColor: palette.slice(0, emps.length) }], height: 160 })),
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "TOP PROCESSES"),
+                React.createElement(DoughnutChart, { labels: topProcs.map(p => p.p), data: topProcs.map(p => p.cases), colors: palette, height: 150 }),
+                React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 } }, topProcs.map((p, i) => (React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 4 } },
+                    React.createElement("div", { style: { width: 8, height: 8, borderRadius: 2, background: palette[i], flexShrink: 0 } }),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 9, color: C.textMid } },
+                        p.p,
+                        " (",
+                        p.cases,
+                        ")"))))))),
+        React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 24, overflowX: "auto" } },
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "EMPLOYEE PERFORMANCE"),
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12 } },
+                React.createElement("thead", null,
+                    React.createElement("tr", null, ["Employee", "Activity", "Last seen", "Today", "This Week", "This Month", "Time/Week", "Avg/Case", "Auto-Closed"].map((h, i) => (React.createElement("th", { key: i, style: { padding: "8px 12px", background: C.surface2, color: C.blue, fontFamily: C.mono, fontSize: 10, textAlign: "left", borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" } }, h))))),
+                React.createElement("tbody", null, emps.map((e, idx) => {
+                    const td = e.byDay[todayK] ? e.byDay[todayK].cases : 0, wk = e.byWeek[weekK] ? e.byWeek[weekK].cases : 0, mk = e.byMonth[monthK] ? e.byMonth[monthK].cases : 0;
+                    const wkMin = e.byWeek[weekK] ? e.byWeek[weekK].totalMin : 0, avg = e.totalCases > 0 ? round1(e.totalMin / e.totalCases) : 0;
+                    const rb = idx % 2 === 0 ? C.surface : C.surface2;
+                    const act = getActivityStatus(e, now);
+                    return (React.createElement("tr", { key: idx },
+                        React.createElement("td", { style: { padding: "9px 12px", background: rb, color: C.text, fontFamily: C.display, fontWeight: 700, fontSize: 14, borderBottom: `1px solid ${C.border}` } }, e.name),
+                        React.createElement("td", { style: { padding: "9px 12px", background: rb, borderBottom: `1px solid ${C.border}` } },
+                            React.createElement(ActivityBadge, { status: act.status, label: act.label, color: act.color })),
+                        React.createElement("td", { style: { padding: "9px 12px", background: rb, fontFamily: C.mono, fontSize: 10, color: act.color, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" } }, e.lastEventTs ? timeAgo(e.lastEventTs) : "—"),
+                        [td, wk, mk, fmtMin(wkMin), fmtMin(avg), e.autoClosed].map((v, i) => (React.createElement("td", { key: i, style: { padding: "9px 12px", background: rb, color: i === 5 && v > 0 ? C.yellow : C.textMid, fontFamily: C.mono, fontWeight: 400, fontSize: 11, borderBottom: `1px solid ${C.border}` } }, v)))));
+                })))),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 } },
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "TOP 5 SLOWEST PROCESSES"),
+                topProcs.map((p, i) => { const rc = [C.red, C.yellow, C.textMid, C.textMid, C.textMid][i], pct = topProcs[0].avg > 0 ? p.avg / topProcs[0].avg * 100 : 0; return (React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 10 } },
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: rc, fontWeight: 700, width: 16 } },
+                        "#",
+                        i + 1),
+                    React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 13, color: C.text, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, p.p),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.blue, flexShrink: 0 } }, fmtMin(p.avg)),
+                    React.createElement("div", { style: { width: 60, height: 5, background: C.surface2, borderRadius: 3, flexShrink: 0 } },
+                        React.createElement("div", { style: { width: `${pct}%`, height: "100%", background: rc, borderRadius: 3 } })))); })),
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, overflowX: "auto" } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "CASES BY PROCESS (TOP 8)"),
+                React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 10 } },
+                    React.createElement("thead", null,
+                        React.createElement("tr", null,
+                            React.createElement("th", { style: { padding: "4px 6px", background: C.surface2, color: C.blue, fontFamily: C.mono, textAlign: "left", borderBottom: `1px solid ${C.border}` } }, "Emp"),
+                            allProcs.map((p, i) => React.createElement("th", { key: i, style: { padding: "4px 6px", background: C.surface2, color: C.blue, fontFamily: C.mono, textAlign: "center", borderBottom: `1px solid ${C.border}`, maxWidth: 60, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, p)))),
+                    React.createElement("tbody", null, emps.map((e, idx) => (React.createElement("tr", { key: idx },
+                        React.createElement("td", { style: { padding: "4px 6px", background: idx % 2 === 0 ? C.surface : C.surface2, color: C.text, fontFamily: C.display, fontWeight: 700, fontSize: 11, borderBottom: `1px solid ${C.border}` } }, e.name),
+                        allProcs.map((p, i) => { const cnt = e.byProcess[p] ? e.byProcess[p].cases : 0; return React.createElement("td", { key: i, style: { padding: "4px 6px", background: idx % 2 === 0 ? C.surface : C.surface2, color: cnt === 0 ? C.textDim : C.green, fontFamily: C.mono, textAlign: "center", borderBottom: `1px solid ${C.border}` } }, cnt || "—"); }))))))))));
+}
+// ── EMPLOYEE DETAIL ────────────────────────────────────────────────────────
+function EmployeeDetail({ emp, now }) {
+    const [showSlowest, setShowSlowest] = useState(false);
+    const [showUrgent, setShowUrgent] = useState(true);
+    // FEAT 1: track which days are expanded in daily breakdown
+    const [expandedDays, setExpandedDays] = useState({});
+    const toggleDay = (dk) => setExpandedDays(prev => (Object.assign(Object.assign({}, prev), { [dk]: !prev[dk] })));
+    const todayK = getDateKey(now), weekK = getWeekKey(now), monthK = getMonthKey(now);
+    const sortedByTime = emp.allCaseDetails.slice().sort((a, b) => a.timeMin - b.timeMin);
+    const fastest = sortedByTime[0] ? round1(sortedByTime[0].timeMin) : 0;
+    const slowest = sortedByTime[sortedByTime.length - 1] ? round1(sortedByTime[sortedByTime.length - 1].timeMin) : 0;
+    const avgTime = emp.totalCases > 0 ? round1(emp.totalMin / emp.totalCases) : 0;
+    const wkMin = emp.byWeek[weekK] ? emp.byWeek[weekK].totalMin : 0;
+    const top5Slowest = emp.allCaseDetails.slice().sort((a, b) => b.timeMin - a.timeMin).slice(0, 5);
+    const urgentCases = emp.allCaseDetails.filter(c => c.urgent === "Si" && c.inLast30).sort((a, b) => b.startD - a.startD);
+    const act = getActivityStatus(emp, now);
+    const last14 = [];
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    while (last14.length < 14) {
+        if (d.getDay() !== 0 && d.getDay() !== 6)
+            last14.unshift(getDateKey(new Date(d)));
+        d.setDate(d.getDate() - 1);
+    }
+    const procEntries = Object.entries(emp.byProcess).sort((a, b) => b[1].cases - a[1].cases).slice(0, 6);
+    const procColors = ["#4d9cf8", "#3fb950", "#d29922", "#da3633", "#a371f7", "#f78166"];
+    const last10 = last14.slice(-10);
+    return (React.createElement("div", null,
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 16, marginBottom: 20, padding: "12px 16px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10 } },
+            React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 16, color: C.text } }, emp.name),
+            React.createElement(ActivityBadge, { status: act.status, label: act.label, color: act.color }),
+            React.createElement("div", { style: { marginLeft: "auto", fontFamily: C.mono, fontSize: 11, color: act.color } }, emp.lastEventTs ? `Last activity: ${timeAgo(emp.lastEventTs)}` : "No recent activity")),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 } },
+            React.createElement(StatCard, { label: "CASES TODAY", value: emp.byDay[todayK] ? emp.byDay[todayK].cases : 0, color: C.green }),
+            React.createElement(StatCard, { label: "CASES THIS WEEK", value: emp.byWeek[weekK] ? emp.byWeek[weekK].cases : 0, color: C.blue }),
+            React.createElement(StatCard, { label: "CASES THIS MONTH", value: emp.byMonth[monthK] ? emp.byMonth[monthK].cases : 0 }),
+            React.createElement(StatCard, { label: "TIME THIS WEEK", value: fmtMin(wkMin), color: C.yellow })),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 } },
+            React.createElement(StatCard, { label: "AVG TIME / CASE", value: fmtMin(avgTime) }),
+            React.createElement(StatCard, { label: "FASTEST CASE", value: fmtMin(fastest), color: C.green }),
+            React.createElement("div", { onClick: () => setShowSlowest(v => !v), style: { background: C.surface, border: `1px solid ${showSlowest ? C.red : C.border}`, borderRadius: 10, padding: "14px 16px", cursor: "pointer", transition: "border-color 0.2s" } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.08em", marginBottom: 6, display: "flex", alignItems: "center", justifyContent: "space-between" } },
+                    React.createElement("span", null, "SLOWEST CASE"),
+                    React.createElement("span", { style: { color: C.textDim, fontSize: 9, background: C.surface2, padding: "1px 5px", borderRadius: 6 } }, showSlowest ? "▲" : "▼ top 5")),
+                React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 22, color: C.red } }, fmtMin(slowest)),
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 9, color: C.textDim, marginTop: 3 } }, "click for details")),
+            React.createElement(StatCard, { label: "AUTO-CLOSED", value: emp.autoClosed, color: emp.autoClosed > 3 ? C.yellow : C.textMid })),
+        showSlowest && top5Slowest.length > 0 && (React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.red}`, borderRadius: 12, padding: 16, marginBottom: 24, animation: "slideDown 0.2s ease" } },
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.red, letterSpacing: "0.1em", marginBottom: 14, display: "flex", alignItems: "center", gap: 8 } },
+                React.createElement("span", null, "\uD83D\uDC22 TOP 5 SLOWEST CASES"),
+                React.createElement("span", { style: { color: C.textDim, fontWeight: 400 } },
+                    "\u2014 ",
+                    emp.totalCases,
+                    " total cases")),
+            top5Slowest.map((c, i) => {
+                const rc = [C.red, C.yellow, C.textMid, C.textMid, C.textMid][i];
+                const cleanNotes = c.notes ? c.notes.replace(" [Auto-closed at 6PM]", "").trim() : "";
+                return (React.createElement("div", { key: i, style: { display: "flex", alignItems: "flex-start", gap: 12, padding: "12px 14px", background: i % 2 === 0 ? C.surface2 : C.bg, borderRadius: 8, marginBottom: 6, borderLeft: `3px solid ${rc}` } },
+                    React.createElement("span", { style: { fontFamily: C.mono, fontWeight: 700, fontSize: 14, color: rc, width: 24, flexShrink: 0, paddingTop: 1 } },
+                        "#",
+                        i + 1),
+                    React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" } },
+                            React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 15, color: C.text } }, c.caseName),
+                            c.urgent === "Si" && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: "#ffd666", background: "#2d1b00", padding: "2px 7px", borderRadius: 10, flexShrink: 0 } }, "\u26A1 URGENT"),
+                            c.autoClosed ? React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, background: C.surface2, padding: "2px 7px", borderRadius: 10, flexShrink: 0 } }, "\uD83E\uDD16 Auto-closed") : React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.green, background: "#1a2d1a", padding: "2px 7px", borderRadius: 10, flexShrink: 0 } }, "\u2713 Manual")),
+                        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, marginBottom: cleanNotes ? 6 : 0 } },
+                            React.createElement("span", { style: { color: C.textDim } }, "\u25CE"),
+                            " ",
+                            c.processName,
+                            React.createElement("span", { style: { color: C.textDim } }, " \u00B7 "),
+                            React.createElement("span", { style: { color: C.blue, fontWeight: 600 } }, fmtMin(c.timeMin))),
+                        cleanNotes && (React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "flex-start", background: "#1c2128", border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 8px" } },
+                            React.createElement("span", { style: { fontSize: 11, flexShrink: 0 } }, "\uD83D\uDCDD"),
+                            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, lineHeight: 1.5, wordBreak: "break-word" } }, cleanNotes))))));
+            }))),
+        urgentCases.length > 0 && (React.createElement("div", { style: { background: C.surface, border: `1px solid #7c5800`, borderRadius: 12, marginBottom: 24 } },
+            React.createElement("div", { onClick: () => setShowUrgent(v => !v), style: { display: "flex", alignItems: "center", gap: 8, padding: "12px 16px", cursor: "pointer", userSelect: "none" } },
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: "#ffd666", letterSpacing: "0.1em", flex: 1 } }, "\u26A1 URGENT CASES \u2014 LAST 30 DAYS"),
+                React.createElement("span", { style: { background: "#2d1b00", color: "#ffd666", padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700 } }, urgentCases.length),
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textDim, marginLeft: 4 } }, showUrgent ? "▲" : "▼")),
+            showUrgent && (React.createElement("div", { style: { padding: "0 16px 14px", animation: "slideDown 0.15s ease" } }, urgentCases.map((c, i) => {
+                const cleanNotes = c.notes ? c.notes.replace(" [Auto-closed at 6PM]", "").trim() : "";
+                return (React.createElement("div", { key: i, style: { display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 12px", background: C.surface2, borderRadius: 8, borderLeft: `3px solid #7c5800`, marginBottom: 6 } },
+                    React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 3, flexWrap: "wrap" } },
+                            React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 14, color: C.text } }, c.caseName),
+                            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textDim, background: C.bg, padding: "1px 6px", borderRadius: 6 } }, shortDate(c.startD)),
+                            c.autoClosed && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, background: C.bg, padding: "1px 6px", borderRadius: 8, flexShrink: 0 } }, "\uD83E\uDD16 Auto-closed"),
+                            !c.autoClosed && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.green, background: "#1a2d1a", padding: "1px 6px", borderRadius: 8, flexShrink: 0 } }, "\u2713 Manual")),
+                        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, marginBottom: cleanNotes ? 4 : 0 } },
+                            React.createElement("span", { style: { color: C.textDim } }, "\u25CE"),
+                            " ",
+                            c.processName,
+                            React.createElement("span", { style: { color: C.textDim } }, " \u00B7 "),
+                            React.createElement("span", { style: { color: C.blue } }, fmtMin(c.timeMin))),
+                        cleanNotes && (React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "flex-start", background: C.bg, borderRadius: 5, padding: "4px 8px", marginTop: 3 } },
+                            React.createElement("span", { style: { fontSize: 10, flexShrink: 0 } }, "\uD83D\uDCDD"),
+                            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, lineHeight: 1.5, wordBreak: "break-word" } }, cleanNotes))))));
+            }))))),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 16, marginBottom: 24 } },
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "DAILY CASES \u2014 LAST 14 WEEKDAYS"),
+                React.createElement(BarChart, { labels: last14.map(dk => { const d2 = new Date(dk + "T12:00:00"); return d2.toLocaleDateString("en-US", { month: "short", day: "numeric" }); }), datasets: [{ label: "Cases", data: last14.map(dk => emp.byDay[dk] ? emp.byDay[dk].cases : 0), backgroundColor: C.blue }], height: 160 })),
+            React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16 } },
+                React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "CASES BY PROCESS"),
+                React.createElement(DoughnutChart, { labels: procEntries.map(([p]) => p), data: procEntries.map(([, v]) => v.cases), colors: procColors, height: 150 }),
+                React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 } }, procEntries.map(([p, v], i) => (React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 4 } },
+                    React.createElement("div", { style: { width: 8, height: 8, borderRadius: 2, background: procColors[i], flexShrink: 0 } }),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 9, color: C.textMid } },
+                        p,
+                        " (",
+                        v.cases,
+                        ")"))))))),
+        React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, marginBottom: 24, overflowX: "auto" } },
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } },
+                "DAILY BREAKDOWN \u2014 LAST 10 WEEKDAYS ",
+                React.createElement("span", { style: { color: C.textDim, fontWeight: 400, fontSize: 9 } }, "(click a row to see cases)")),
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 11 } },
+                React.createElement("thead", null,
+                    React.createElement("tr", null, ["Date", "Cases", "Time Worked", "Avg Min/Case"].map((h, i) => (React.createElement("th", { key: i, style: { padding: "7px 12px", background: C.surface2, color: C.blue, fontFamily: C.mono, fontSize: 10, textAlign: "left", borderBottom: `1px solid ${C.border}` } }, h))))),
+                React.createElement("tbody", null, last10.map((dk, idx) => {
+                    const v = emp.byDay[dk] || { cases: 0, totalMin: 0 };
+                    const avg = v.cases > 0 ? round1(v.totalMin / v.cases) : 0;
+                    const d2 = new Date(dk + "T12:00:00");
+                    const rb = idx % 2 === 0 ? C.surface : C.surface2;
+                    const isExpanded = !!expandedDays[dk];
+                    const dayCases = emp.allCaseDetails.filter(c => c.dk === dk);
+                    const isClickable = v.cases > 0;
+                    return (React.createElement(React.Fragment, { key: dk },
+                        React.createElement("tr", { onClick: () => isClickable && toggleDay(dk), style: { cursor: isClickable ? "pointer" : "default" } },
+                            React.createElement("td", { style: { padding: "7px 12px", background: rb, color: isExpanded ? C.blue : C.text, fontFamily: C.mono, fontSize: 11, borderBottom: isExpanded ? "none" : `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 6 } },
+                                isClickable && React.createElement("span", { style: { fontSize: 9, color: C.textDim } }, isExpanded ? "▼" : "▶"),
+                                d2.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })),
+                            React.createElement("td", { style: { padding: "7px 12px", background: rb, color: v.cases > 0 ? C.green : C.textDim, fontFamily: C.mono, fontSize: 11, borderBottom: isExpanded ? "none" : `1px solid ${C.border}` } }, v.cases || "—"),
+                            React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.textMid, fontFamily: C.mono, fontSize: 11, borderBottom: isExpanded ? "none" : `1px solid ${C.border}` } }, v.cases > 0 ? fmtMin(v.totalMin) : "—"),
+                            React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.textMid, fontFamily: C.mono, fontSize: 11, borderBottom: isExpanded ? "none" : `1px solid ${C.border}` } }, avg > 0 ? fmtMin(avg) : "—")),
+                        isExpanded && dayCases.length > 0 && (React.createElement("tr", null,
+                            React.createElement("td", { colSpan: 4, style: { padding: "4px 12px 10px", background: rb, borderBottom: `1px solid ${C.border}` } },
+                                React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4, paddingLeft: 16, borderLeft: `2px solid ${C.border}` } }, dayCases.map((c, ci) => (React.createElement("div", { key: ci, style: { display: "flex", alignItems: "center", gap: 10, padding: "4px 0" } },
+                                    React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 12, color: C.text, minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, c.caseName),
+                                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, flexShrink: 0 } },
+                                        "\u25CE ",
+                                        c.processName),
+                                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.blue, flexShrink: 0 } }, fmtMin(c.timeMin)))))))))));
+                })))),
+        React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 16, overflowX: "auto" } },
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12 } }, "WEEKLY SUMMARY"),
+            React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 11 } },
+                React.createElement("thead", null,
+                    React.createElement("tr", null, ["Week", "Cases", "Time Worked", "Avg Min/Case"].map((h, i) => (React.createElement("th", { key: i, style: { padding: "7px 12px", background: C.surface2, color: C.blue, fontFamily: C.mono, fontSize: 10, textAlign: "left", borderBottom: `1px solid ${C.border}` } }, h))))),
+                React.createElement("tbody", null, Object.entries(emp.byWeek).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 8).map(([wk, v], idx) => { const avg = v.cases > 0 ? round1(v.totalMin / v.cases) : 0, rb = idx % 2 === 0 ? C.surface : C.surface2; return (React.createElement("tr", { key: idx },
+                    React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.text, fontFamily: C.mono, fontSize: 11, borderBottom: `1px solid ${C.border}` } },
+                        "Week of ",
+                        wk),
+                    React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.green, fontFamily: C.mono, fontSize: 11, borderBottom: `1px solid ${C.border}` } }, v.cases),
+                    React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.blue, fontFamily: C.mono, fontSize: 11, borderBottom: `1px solid ${C.border}` } }, fmtMin(v.totalMin)),
+                    React.createElement("td", { style: { padding: "7px 12px", background: rb, color: C.textMid, fontFamily: C.mono, fontSize: 11, borderBottom: `1px solid ${C.border}` } }, fmtMin(avg)))); }))))));
+}
+// ── OPERATIONAL RULES (kept in admin tab) ──────────────────────────────────
+function OperationalRules() {
+    const rules = [
+        { icon: "▶", color: C.green, title: "Always start a case before working", tag: "Data quality",
+            desc: "Log the task the moment you open it. Don't wait until the end of the day — you'll forget details and the timestamps will be wrong." },
+        { icon: "✓", color: C.blue, title: "Always close your case when finished", tag: "Accurate time",
+            desc: "Click Done as soon as you finish. An open case keeps counting time and distorts your real numbers." },
+        { icon: "⏸", color: C.yellow, title: "Pause cases when you stop working on them", tag: "Accurate time",
+            desc: "Got a call, a meeting, or switching tasks? Hit Hold. Don't let the clock run on something you're not actively doing." },
+        { icon: "🚫", color: C.red, title: "Do not leave cases open", tag: "Data integrity",
+            desc: "At 6PM the system auto-closes everything open. That's a safety net, not standard procedure. Close your cases manually before you leave." },
+        { icon: "📋", color: C.textMid, title: "If it's not registered, it didn't happen", tag: "Golden rule",
+            desc: "The dashboard only knows what's logged. If you worked on something and didn't track it, it doesn't exist in the metrics." },
+        { icon: "🔤", color: C.blue, title: "Write process names consistently", tag: "Normalization",
+            desc: 'The system groups similar names automatically, but it helps to be consistent. "Scrub", "UCC", "NOD Draft" — pick one spelling and stick to it.' },
+        { icon: "⚡", color: "#ffd666", title: "Only mark urgent when it actually is", tag: "Reliable flags",
+            desc: "If everything is urgent, nothing is. Use the flag only when there's an explicit client request or a hard deadline." },
+        { icon: "🧾", color: C.textMid, title: "One case = one specific task", tag: "Granularity",
+            desc: "Don't batch multiple processes into one case. Each process deserves its own entry so time per process can be measured correctly." },
+    ];
+    const tagColor = { "Data quality": C.green, "Accurate time": C.blue, "Data integrity": C.red, "Golden rule": C.green, "Normalization": C.blue, "Reliable flags": "#ffd666", "Granularity": C.textMid };
+    return (React.createElement("div", null,
+        React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: "20px 24px", marginBottom: 24 } },
+            React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 22, color: C.text, marginBottom: 6 } }, "\uD83D\uDCCB System Usage Guide"),
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 12, color: C.textMid, lineHeight: 1.7 } }, "These rules keep the data accurate and useful for everyone on the team. They're not bureaucracy \u2014 they're the difference between a dashboard you can trust and one that lies to you.")),
+        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 } }, rules.map((r, i) => (React.createElement("div", { key: i, style: { background: C.surface, border: `1px solid ${C.border}`, borderLeft: `4px solid ${r.color}`, borderRadius: 10, padding: "16px 18px" } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 } },
+                React.createElement("span", { style: { fontFamily: C.mono, fontWeight: 700, fontSize: 16, color: r.color, flexShrink: 0 } }, r.icon),
+                React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 15, color: C.text, lineHeight: 1.2 } }, r.title)),
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, lineHeight: 1.65, marginBottom: 10 } }, r.desc),
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 9, color: tagColor[r.tag] || C.textDim, background: C.surface2, padding: "2px 8px", borderRadius: 10, letterSpacing: "0.06em" } }, r.tag.toUpperCase()))))),
+        React.createElement("div", { style: { background: "#0d1f12", border: `1px solid ${C.borderActive}`, borderRadius: 10, padding: "14px 18px", marginTop: 20 } },
+            React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.green, letterSpacing: "0.1em", marginBottom: 8 } }, "\uD83D\uDCA1 GOLDEN RULE"),
+            React.createElement("div", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 16, color: C.text, lineHeight: 1.5 } },
+                "If it's not in the system, it didn't happen.",
+                React.createElement("br", null),
+                React.createElement("span", { style: { color: C.textMid, fontWeight: 400, fontSize: 14 } }, "Logging correctly takes 10 seconds. Reconstructing bad data takes hours.")))));
+}
+// ── FEAT 4: USAGE GUIDE (simple box for employee screen) ──────────────────
+function UsageGuide() {
+    const [open, setOpen] = useState(false);
+    const items = [
+        "Always start a case before working on it.",
+        "Always close your case when you're done.",
+        "Do not leave cases open — close or pause before switching.",
+        "Pause cases when interrupted or switching tasks.",
+        "If it's not registered, it didn't happen.",
+    ];
+    return (React.createElement("div", { style: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 20 } },
+        React.createElement("div", { onClick: () => setOpen(v => !v), style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", cursor: "pointer", userSelect: "none" } },
+            React.createElement("span", { style: { fontSize: 13 } }, "\uD83D\uDCD8"),
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, flex: 1, letterSpacing: "0.06em" } }, "USAGE GUIDE"),
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 9, color: C.textDim } }, open ? "▲" : "▼")),
+        open && (React.createElement("div", { style: { padding: "0 16px 12px", animation: "slideDown 0.15s ease" } }, items.map((item, i) => (React.createElement("div", { key: i, style: { display: "flex", alignItems: "flex-start", gap: 8, padding: "5px 0", borderTop: `1px solid ${C.border}` } },
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.blue, flexShrink: 0, paddingTop: 1 } },
+                i + 1,
+                "."),
+            React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, lineHeight: 1.5 } }, item))))))));
+}
+// ── ADMIN DASHBOARD ────────────────────────────────────────────────────────
+function AdminDashboard({ onLogout, onMaintChange }) {
+    const [reportRows, setReportRows] = useState(null), [loading, setLoading] = useState(true), [error, setError] = useState("");
+    const [view, setView] = useState("overview"), [lastUpdate, setLastUpdate] = useState(null);
+    // FEAT 5: maintenance toggle state
+    const [maint, setMaint] = useState(MAINT.active);
+    const load = useCallback(async () => {
+        try {
+            const rows = await apiFetchReport();
+            setReportRows(rows);
+            setLastUpdate(new Date());
+            setError("");
+        }
+        catch (e) {
+            setError("Failed to load. Check Apps Script deployment.");
+        }
+        finally {
+            setLoading(false);
+        }
+    }, []);
+    useEffect(() => { load(); }, [load]);
+    useEffect(() => { const id = setInterval(() => load(), 60000); return () => clearInterval(id); }, [load]);
+    const parsed = reportRows ? parseReportRows(reportRows) : null;
+    const emps = parsed ? Object.values(parsed.empMap).sort((a, b) => b.totalCases - a.totalCases) : [];
+    const tabs = [{ id: "overview", label: "Overview" }, { id: "rules", label: "📋 Guide" }, ...emps.map(e => ({ id: e.email, label: e.name }))];
+    const toggleMaint = () => {
+        const next = !maint;
+        MAINT.active = next;
+        setMaint(next);
+        if (onMaintChange)
+            onMaintChange(next);
+    };
+    return (React.createElement("div", { style: { minHeight: "100vh", background: C.bg, position: "relative" } },
+        React.createElement(GridBg, null),
+        React.createElement("div", { style: { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "10px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100 } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
+                React.createElement(LxLogo, { size: 36 }),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 20, color: C.text } }, "Admin Dashboard"),
+                    React.createElement("div", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid } }, lastUpdate ? `Updated ${lastUpdate.toLocaleTimeString("en-US")} · Auto-refresh 60s` : "Loading..."))),
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, background: maint ? "#1c1000" : C.surface2, border: `1px solid ${maint ? C.yellow : C.border}`, borderRadius: 20, padding: "4px 14px" } },
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: maint ? C.yellow : C.textMid } }, "\uD83D\uDD27 Maintenance"),
+                    React.createElement("div", { onClick: toggleMaint, style: { width: 32, height: 18, borderRadius: 9, background: maint ? "#7c5800" : C.border, cursor: "pointer", position: "relative", transition: "background 0.2s", flexShrink: 0 } },
+                        React.createElement("div", { style: { position: "absolute", top: 2, left: maint ? 14 : 2, width: 14, height: 14, borderRadius: "50%", background: maint ? C.yellow : C.textDim, transition: "left 0.2s" } }))),
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 12px" } },
+                    React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: C.green, display: "inline-block", animation: "pulse-dot 2s infinite" } }),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.green } }, "Live")),
+                React.createElement("button", { onClick: onLogout, style: { background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 14px", fontFamily: C.mono, fontSize: 11, color: C.textMid, cursor: "pointer" } }, "\u2190 Exit Admin"))),
+        React.createElement("div", { style: { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "0 24px", display: "flex", gap: 4, overflowX: "auto" } }, tabs.map(tab => (React.createElement("button", { key: tab.id, onClick: () => setView(tab.id), style: { padding: "10px 16px", background: "transparent", border: "none", borderBottom: `2px solid ${view === tab.id ? C.blue : "transparent"}`, color: view === tab.id ? C.blue : tab.id === "rules" ? C.yellow : C.textMid, fontFamily: C.display, fontWeight: 700, fontSize: 14, cursor: "pointer", whiteSpace: "nowrap", transition: "all 0.15s" } }, tab.label)))),
+        React.createElement("div", { style: { maxWidth: 1200, margin: "0 auto", padding: "24px", position: "relative", zIndex: 1 } },
+            loading && React.createElement("div", { style: { textAlign: "center", padding: 60, color: C.textMid, fontFamily: C.mono, fontSize: 13 } },
+                React.createElement("div", { style: { width: 24, height: 24, border: `2px solid ${C.border}`, borderTop: `2px solid ${C.blue}`, borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" } }),
+                "Loading dashboard data..."),
+            !loading && error && React.createElement("div", { style: { background: "#2d0f0f", border: `1px solid ${C.red}`, borderRadius: 10, padding: 16, color: C.red, fontFamily: C.mono, fontSize: 12 } }, error),
+            !loading && !error && (React.createElement(React.Fragment, null,
+                view === "overview" && parsed && React.createElement(AdminOverview, { parsed: parsed }),
+                view === "rules" && React.createElement(OperationalRules, null),
+                view !== "overview" && view !== "rules" && parsed && parsed.empMap[view] && React.createElement(EmployeeDetail, { emp: parsed.empMap[view], now: parsed.now })))),
+        React.createElement(Footer, null)));
+}
+// ── CASE CARD ──────────────────────────────────────────────────────────────
+function CaseCard({ caso, onAction, now, readonly }) {
+    const ls = lastStatus(caso), isDone = ls === S.DONE, isPaused = ls === S.PAUSED, isActive = ls === S.STARTED || ls === S.RESUMED;
+    const pauses = pauseCount(caso), elapsed = computeElapsed(caso.events, now);
+    const [saving, setSaving] = useState(false);
+    const doAction = async (status) => { setSaving(true); await onAction(caso, status); setSaving(false); };
+    const lastEv = caso.events[caso.events.length - 1];
+    const minsOpen = !isDone ? (now - new Date(lastEv.ts).getTime()) / 60000 : 0;
+    const isForgotten = !isDone && minsOpen >= FORGOTTEN_MIN;
+    const bc = isDone ? C.border : isForgotten ? C.red : isActive ? C.borderActive : isPaused ? "#7c5800" : C.border;
+    const hasNotes = caso.notes && String(caso.notes).trim().length > 0;
+    return (React.createElement("div", { style: { background: C.surface, border: `1px solid ${bc}`, borderLeft: `4px solid ${bc}`, borderRadius: 12, padding: "16px 20px", animation: "fadeIn 0.3s ease", opacity: isDone ? 0.75 : 1 } },
+        React.createElement("div", { style: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 } },
+            React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" } },
+                    React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 17, color: C.text } }, caso.caseName),
+                    caso.urgent === "Si" && React.createElement("span", null, "\u26A1"),
+                    isForgotten && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.red, background: "#2d0f0f", padding: "1px 7px", borderRadius: 10, animation: "alertPulse 2s infinite" } },
+                        "\uD83D\uDEA8 ",
+                        timeAgo(lastEv.ts)),
+                    isDone && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, marginLeft: "auto" } }, "\u2713 COMPLETED")),
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: hasNotes ? 8 : 0 } },
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid } },
+                        "\u25CE ",
+                        caso.processName),
+                    isActive && (React.createElement("span", { style: { background: "#1a3d2a", color: C.green, fontFamily: C.mono, fontSize: 11, padding: "2px 8px", borderRadius: 20, display: "flex", alignItems: "center", gap: 4 } },
+                        React.createElement("span", { style: { width: 6, height: 6, borderRadius: "50%", background: C.green, display: "inline-block", animation: "pulse-dot 1.5s infinite" } }),
+                        " Active")),
+                    isPaused && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: "#ffd666" } }, "\u23F8 On Hold"),
+                    isDone && React.createElement(React.Fragment, null,
+                        React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.green } }, "\u2713 Completed"),
+                        pauses > 0 && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.blue } },
+                            pauses,
+                            " pause",
+                            pauses > 1 ? "s" : "")),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: isDone ? C.textMid : isActive ? C.blue : C.textMid, display: "flex", alignItems: "center", gap: 4 } },
+                        isActive && React.createElement("span", { style: { fontSize: 10 } }, "\uD83D\uDD50"),
+                        isDone ? `✓ ${formatElapsed(elapsed)} worked` : formatElapsed(elapsed)),
+                    !isDone && pauses > 0 && React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid } },
+                        pauses,
+                        " pause",
+                        pauses > 1 ? "s" : "")),
+                hasNotes && (React.createElement("div", { style: { display: "flex", alignItems: "flex-start", gap: 6, marginTop: 6, background: "#1c2128", border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px" } },
+                    React.createElement("span", { style: { fontSize: 11, flexShrink: 0, marginTop: 1 } }, "\uD83D\uDCDD"),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, lineHeight: 1.5, wordBreak: "break-word" } }, caso.notes)))),
+            !isDone && !readonly && (React.createElement("div", { style: { display: "flex", gap: 8, flexShrink: 0, marginTop: 2 } },
+                isActive && React.createElement("button", { onClick: () => doAction(S.PAUSED), disabled: saving, style: { padding: "8px 18px", background: "#7c5800", color: "#ffd666", border: "1px solid #7c5800", borderRadius: 8, fontFamily: C.display, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 } }, "\u23F8 Hold"),
+                isPaused && React.createElement("button", { onClick: () => doAction(S.RESUMED), disabled: saving, style: { padding: "8px 18px", background: "#1a3d2a", color: C.green, border: `1px solid ${C.borderActive}`, borderRadius: 8, fontFamily: C.display, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 } }, "\u21BA Resume"),
+                (isActive || isPaused) && React.createElement("button", { onClick: () => doAction(S.DONE), disabled: saving, style: { padding: "8px 18px", background: "#5a1b1a", color: "#ff7b72", border: "1px solid #5a1b1a", borderRadius: 8, fontFamily: C.display, fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 } }, "\u2713 Done"))))));
+}
+// ── HISTORY ────────────────────────────────────────────────────────────────
+function HistoryTab({ rows, now }) {
+    const allCases = Object.values(groupRows(rows));
+    if (allCases.length === 0)
+        return (React.createElement("div", { style: { textAlign: "center", padding: "48px 24px", background: C.surface, border: `1px dashed ${C.border}`, borderRadius: 12, color: C.textDim, fontFamily: C.mono, fontSize: 13 } },
+            React.createElement("div", { style: { fontSize: 32, marginBottom: 12 } }, "\uD83D\uDDC2"),
+            "No records yet."));
+    const byDate = {};
+    for (const c of allCases) {
+        const dk = c.dk || getDateKey(c.events[0].ts);
+        if (!byDate[dk])
+            byDate[dk] = [];
+        byDate[dk].push(c);
+    }
+    const todayDk = getDateKey(new Date().toISOString()), sortedDates = Object.keys(byDate).sort((a, b) => b.localeCompare(a));
+    return (React.createElement("div", null,
+        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, letterSpacing: "0.1em", marginBottom: 16, borderBottom: `1px solid ${C.border}`, paddingBottom: 8 } }, "MY HISTORY \u2014 LAST 30 DAYS"),
+        sortedDates.map(dk => { const sorted = sortCases(byDate[dk]), isCurrentDay = dk === todayDk; return (React.createElement("div", { key: dk, style: { marginBottom: 28 } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 12 } },
+                React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 14, color: isCurrentDay ? C.blue : C.textMid, textTransform: "capitalize" } },
+                    "\uD83D\uDCC5 ",
+                    isCurrentDay ? "Today — " : "",
+                    friendlyDate(dk)),
+                React.createElement("span", { style: { fontFamily: C.mono, fontSize: 10, color: C.textDim } },
+                    sorted.length,
+                    " case",
+                    sorted.length > 1 ? "s" : "")),
+            React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } }, sorted.map(c => React.createElement(CaseCard, { key: c.key, caso: c, onAction: () => { }, now: now, readonly: true }))))); })));
+}
+// ── MAIN DASHBOARD ─────────────────────────────────────────────────────────
+function Dashboard({ user, onLogout, onAdmin, maintActive }) {
+    const [rows, setRows] = useState([]), [loading, setLoading] = useState(true), [connStatus, setConnStatus] = useState("connecting");
+    const [tab, setTab] = useState("active"), [newCase, setNewCase] = useState(""), [newProcess, setNewProcess] = useState("");
+    const [newNotes, setNewNotes] = useState(""), [newUrgent, setNewUrgent] = useState(false), [newState, setNewState] = useState(S.STARTED);
+    const [submitting, setSubmitting] = useState(false), [formErr, setFormErr] = useState(""), [now, setNow] = useState(Date.now());
+    const load = useCallback(async () => { try {
+        const data = await apiFetch(user);
+        setRows(data);
+        setConnStatus("ok");
+    }
+    catch (_a) {
+        setConnStatus("error");
+    }
+    finally {
+        setLoading(false);
+    } }, [user]);
+    useEffect(() => { load(); }, [load]);
+    useEffect(() => { const id = setInterval(() => load(), 15000); return () => clearInterval(id); }, [load]);
+    useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
+    const todayRows = rows.filter(r => isToday(r[0])), todayCases = sortCases(Object.values(groupRows(todayRows)));
+    const activeCases = todayCases.filter(c => lastStatus(c) !== S.DONE), doneCases = todayCases.filter(c => lastStatus(c) === S.DONE);
+    const handleAction = async (caso, newSt) => {
+        if (maintActive) {
+            alert("System is under maintenance. Actions are blocked.");
+            return;
+        }
+        const ts = new Date().toISOString();
+        const row = [ts, user, caso.caseName, caso.processName, newSt, caso.urgent, caso.notes || "", caso.key];
+        setRows(prev => [...prev, row]);
+        await apiAppend(row);
+        setTimeout(() => load(), 3000);
+    };
+    const handleSubmit = async () => {
+        if (maintActive) {
+            setFormErr("System is under maintenance. New registrations are blocked.");
+            return;
+        }
+        if (!newCase.trim()) {
+            setFormErr("Case name is required");
+            return;
+        }
+        if (!newProcess.trim()) {
+            setFormErr("Process name is required");
+            return;
+        }
+        setFormErr("");
+        setSubmitting(true);
+        const ts = new Date().toISOString(), codigo = makeCode();
+        const row = [ts, user, newCase.trim(), newProcess.trim(), newState, newUrgent ? "Si" : "No", newNotes.trim(), codigo];
+        setRows(prev => [...prev, row]);
+        await apiAppend(row);
+        setNewCase("");
+        setNewProcess("");
+        setNewNotes("");
+        setNewUrgent(false);
+        setNewState(S.STARTED);
+        setSubmitting(false);
+        setTimeout(() => load(), 3000);
+    };
+    const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    const connColor = connStatus === "ok" ? C.green : connStatus === "error" ? C.red : C.yellow;
+    return (React.createElement("div", { style: { minHeight: "100vh", background: C.bg, fontFamily: "'Barlow',sans-serif", position: "relative" } },
+        React.createElement(GridBg, null),
+        maintActive && React.createElement(MaintenanceBanner, null),
+        React.createElement("div", { style: { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "10px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: maintActive ? 40 : 0, zIndex: 100 } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
+                React.createElement(LxLogo, { size: 38 }),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 22, color: C.text, lineHeight: 1 } }, "Case Tracker"),
+                    React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, marginTop: 2 } }, dateStr))),
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+                React.createElement(MyStatusWidget, { rows: rows }),
+                React.createElement("button", { onClick: onAdmin, style: { background: "transparent", border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 14px", fontFamily: C.mono, fontSize: 11, color: C.textMid, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 } },
+                    React.createElement("span", { style: { fontSize: 12 } }, "\uD83D\uDD10"),
+                    " Admin"),
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6, background: C.surface2, border: `1px solid ${connStatus === "error" ? C.red : C.border}`, borderRadius: 20, padding: "4px 12px" } },
+                    React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", display: "inline-block", background: connColor, animation: connStatus === "ok" ? "pulse-dot 2s infinite" : "none" } }),
+                    React.createElement("span", { style: { fontFamily: C.mono, fontSize: 11, color: connColor } }, connStatus === "ok" ? "Online" : connStatus === "error" ? "Error" : "Connecting...")),
+                React.createElement("div", { style: { background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 20, padding: "4px 14px", fontFamily: C.mono, fontSize: 12, color: C.textMid, display: "flex", alignItems: "center", gap: 8 } },
+                    user,
+                    React.createElement("button", { onClick: onLogout, style: { background: "none", border: "none", color: C.textMid, cursor: "pointer", fontFamily: C.mono, fontSize: 11, padding: "0 0 0 4px" } }, "sign out")))),
+        React.createElement("div", { style: { maxWidth: 1100, margin: "0 auto", padding: "24px", position: "relative", zIndex: 1 } },
+            React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 24 } }, [["active", "Active Cases"], ["history", "My History"]].map(([key, label]) => (React.createElement("button", { key: key, onClick: () => setTab(key), style: { padding: "8px 20px", borderRadius: 20, border: `1px solid ${tab === key ? C.blue : C.border}`, background: tab === key ? C.blue : "transparent", color: tab === key ? "#0d1117" : C.textMid, fontFamily: C.display, fontWeight: 700, fontSize: 15, cursor: "pointer", transition: "all 0.15s" } }, label)))),
+            tab === "active" && (React.createElement(React.Fragment, null,
+                React.createElement(UsageGuide, null),
+                React.createElement("div", { style: { marginBottom: 32 } },
+                    React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12, borderBottom: `1px solid ${C.border}`, paddingBottom: 8 } }, "LOG NEW TASK"),
+                    React.createElement("div", { style: { background: C.surface, border: `1px solid ${maintActive ? C.yellow : C.border}`, borderRadius: 12, padding: "20px 24px", opacity: maintActive ? 0.6 : 1 } },
+                        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 } },
+                            React.createElement("div", null,
+                                React.createElement("label", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, display: "block", marginBottom: 6, letterSpacing: "0.08em" } }, "CASE NAME *"),
+                                React.createElement("input", { value: newCase, onChange: e => setNewCase(e.target.value), disabled: maintActive, placeholder: "Case / client name", style: { width: "100%", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontSize: 14, opacity: maintActive ? 0.5 : 1 }, onFocus: e => { if (!maintActive)
+                                        e.target.style.borderColor = C.blue; }, onBlur: e => e.target.style.borderColor = C.border })),
+                            React.createElement("div", null,
+                                React.createElement("label", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, display: "block", marginBottom: 6, letterSpacing: "0.08em" } }, "PROCESS NAME *"),
+                                React.createElement("input", { value: newProcess, onChange: e => setNewProcess(e.target.value), disabled: maintActive, placeholder: "e.g. Scrub, UCC, NOD Draft...", style: { width: "100%", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontSize: 14, opacity: maintActive ? 0.5 : 1 }, onFocus: e => { if (!maintActive)
+                                        e.target.style.borderColor = C.blue; }, onBlur: e => e.target.style.borderColor = C.border }))),
+                        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 } },
+                            React.createElement("div", null,
+                                React.createElement("label", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, display: "block", marginBottom: 6, letterSpacing: "0.08em" } }, "STATUS"),
+                                React.createElement("select", { value: newState, onChange: e => setNewState(e.target.value), disabled: maintActive, style: { width: "100%", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontSize: 14, appearance: "none", cursor: maintActive ? "not-allowed" : "pointer", opacity: maintActive ? 0.5 : 1 } },
+                                    React.createElement("option", { value: S.STARTED }, "\u25B6 On this \u2014 Starting"),
+                                    React.createElement("option", { value: S.PAUSED }, "\u23F8 On Hold \u2014 Pause"),
+                                    React.createElement("option", { value: S.RESUMED }, "\u21BA Resuming \u2014 Resume"),
+                                    React.createElement("option", { value: S.DONE }, "\u2713 Done, Completed \u2014 Finish"))),
+                            React.createElement("div", null,
+                                React.createElement("label", { style: { fontFamily: C.mono, fontSize: 10, color: C.textMid, display: "block", marginBottom: 6, letterSpacing: "0.08em" } }, "ADDITIONAL NOTES"),
+                                React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+                                    React.createElement("input", { value: newNotes, onChange: e => setNewNotes(e.target.value), disabled: maintActive, placeholder: "Optional...", style: { flex: 1, background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontSize: 14, opacity: maintActive ? 0.5 : 1 }, onFocus: e => { if (!maintActive)
+                                            e.target.style.borderColor = C.blue; }, onBlur: e => e.target.style.borderColor = C.border }),
+                                    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6, cursor: maintActive ? "not-allowed" : "pointer", flexShrink: 0, opacity: maintActive ? 0.4 : 1 }, onClick: () => !maintActive && setNewUrgent(v => !v) },
+                                        React.createElement("div", { style: { width: 18, height: 18, borderRadius: 4, border: `2px solid ${newUrgent ? C.yellow : C.border}`, background: newUrgent ? "#7c5800" : "transparent", display: "flex", alignItems: "center", justifyContent: "center" } }, newUrgent && React.createElement("span", { style: { color: "#ffd666", fontSize: 11 } }, "\u2713")),
+                                        React.createElement("span", { style: { fontFamily: C.display, fontWeight: 700, fontSize: 14, color: newUrgent ? "#ffd666" : C.textMid } }, "\u26A1 Urgent"))))),
+                        formErr && React.createElement("p", { style: { color: maintActive ? C.yellow : C.red, fontFamily: C.mono, fontSize: 11, marginBottom: 10 } }, formErr),
+                        React.createElement("button", { onClick: handleSubmit, disabled: submitting || maintActive, style: { padding: "10px 22px", background: maintActive ? "#1c1000" : submitting ? C.surface2 : C.blue, color: maintActive ? C.yellow : submitting ? C.textMid : "#0d1117", border: `1px solid ${maintActive ? C.yellow : "transparent"}`, borderRadius: 8, fontFamily: C.display, fontWeight: 700, fontSize: 15, cursor: submitting || maintActive ? "not-allowed" : "pointer" } }, maintActive ? "🔧 Maintenance — blocked" : submitting ? "Saving..." : "+ Log Task"))),
+                loading ? (React.createElement("div", { style: { textAlign: "center", padding: 40, color: C.textMid, fontFamily: C.mono, fontSize: 13 } }, "Loading data...")) : (React.createElement(React.Fragment, null,
+                    React.createElement(ForgottenCasesAlert, { cases: activeCases, now: now }),
+                    activeCases.length > 0 && (React.createElement("div", { style: { marginBottom: 28 } },
+                        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12, borderBottom: `1px solid ${C.border}`, paddingBottom: 8, display: "flex", justifyContent: "space-between" } },
+                            React.createElement("span", null, "IN PROGRESS"),
+                            React.createElement("span", { style: { color: C.green } },
+                                activeCases.length,
+                                " active")),
+                        React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, activeCases.map(c => React.createElement(CaseCard, { key: c.key, caso: c, onAction: handleAction, now: now }))))),
+                    doneCases.length > 0 && (React.createElement("div", null,
+                        React.createElement("div", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, letterSpacing: "0.1em", marginBottom: 12, borderBottom: `1px solid ${C.border}`, paddingBottom: 8, display: "flex", justifyContent: "space-between" } },
+                            React.createElement("span", null, "COMPLETED TODAY"),
+                            React.createElement("span", null,
+                                doneCases.length,
+                                " case",
+                                doneCases.length > 1 ? "s" : "")),
+                        React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } }, doneCases.map(c => React.createElement(CaseCard, { key: c.key, caso: c, onAction: handleAction, now: now }))))),
+                    activeCases.length === 0 && doneCases.length === 0 && (React.createElement("div", { style: { textAlign: "center", padding: "48px 24px", background: C.surface, border: `1px dashed ${C.border}`, borderRadius: 12, color: C.textDim, fontFamily: C.mono, fontSize: 13 } },
+                        React.createElement("div", { style: { fontSize: 32, marginBottom: 12 } }, "\uD83D\uDCCB"),
+                        "No tasks logged today.",
+                        React.createElement("br", null),
+                        "Use the form above to log a new one.")))))),
+            tab === "history" && (loading ? React.createElement("div", { style: { textAlign: "center", padding: 40, color: C.textMid, fontFamily: C.mono, fontSize: 13 } }, "Loading history...") : React.createElement(HistoryTab, { rows: rows, now: now }))),
+        React.createElement(Footer, null)));
+}
+// ── LOGIN ──────────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin, maintActive }) {
+    const [val, setVal] = useState(""), [err, setErr] = useState(""), [loading, setLoading] = useState(false);
+    const submit = async () => { if (!val.trim()) {
+        setErr("Enter your email or username");
+        return;
+    } setLoading(true); await delay(300); onLogin(val.trim().toLowerCase()); setLoading(false); };
+    return (React.createElement("div", { style: { minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-start", padding: "48px 16px", position: "relative" } },
+        React.createElement(GridBg, null),
+        maintActive && React.createElement("div", { style: { position: "fixed", top: 0, left: 0, right: 0, zIndex: 200 } },
+            React.createElement(MaintenanceBanner, null)),
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 18, marginBottom: 24, zIndex: 1 } },
+            React.createElement(LxLogo, { size: 72 }),
+            React.createElement("div", null,
+                React.createElement("h1", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 42, color: C.text, letterSpacing: "-0.5px", lineHeight: 1.1 } }, "Lexington Recovery"),
+                React.createElement("p", { style: { fontFamily: C.mono, fontSize: 13, color: C.textMid, marginTop: 4 } }, "Case Tracking & Management"))),
+        React.createElement("div", { style: { width: "100%", maxWidth: 560, height: 1, background: C.border, marginBottom: 32, zIndex: 1 } }),
+        React.createElement("div", { style: { width: "100%", maxWidth: 560, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16, padding: "36px 32px", zIndex: 1, animation: "fadeIn 0.4s ease" } },
+            React.createElement("h2", { style: { fontFamily: C.display, fontWeight: 800, fontSize: 38, color: C.text, marginBottom: 8 } }, "Sign In"),
+            React.createElement("p", { style: { fontFamily: C.mono, fontSize: 13, color: C.textMid, marginBottom: 28 } }, "Enter your email or name to continue"),
+            React.createElement("label", { style: { fontFamily: C.mono, fontSize: 11, color: C.textMid, letterSpacing: "0.08em", display: "block", marginBottom: 8 } }, "EMAIL OR USERNAME"),
+            React.createElement("input", { value: val, onChange: e => setVal(e.target.value), onKeyDown: e => e.key === "Enter" && submit(), placeholder: "e.g. ana@lexingtonrecovery.com", style: { width: "100%", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 10, padding: "14px 16px", color: C.text, fontSize: 15, marginBottom: err ? 8 : 20 }, onFocus: e => e.target.style.borderColor = C.blue, onBlur: e => e.target.style.borderColor = C.border }),
+            err && React.createElement("p", { style: { color: C.red, fontSize: 12, fontFamily: C.mono, marginBottom: 12 } }, err),
+            React.createElement("button", { onClick: submit, disabled: loading, style: { width: "100%", padding: "16px", background: loading ? C.surface2 : C.blue, color: loading ? C.textMid : "#0d1117", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700, fontFamily: C.display, cursor: loading ? "not-allowed" : "pointer" } }, loading ? "Connecting..." : "Sign In →")),
+        React.createElement("div", { style: { position: "absolute", bottom: 0, left: 0, right: 0 } },
+            React.createElement(Footer, null))));
+}
+// ── ROOT ───────────────────────────────────────────────────────────────────
+function App() {
+    const [screen, setScreen] = useState("login"), [user, setUser] = useState(null);
+    // FEAT 5: maintenance state lives here so it propagates to all screens
+    const [maintActive, setMaintActive] = useState(false);
+    return (React.createElement(React.Fragment, null,
+        screen === "login" && React.createElement(LoginScreen, { onLogin: u => { setUser(u); setScreen("app"); }, maintActive: maintActive }),
+        screen === "app" && React.createElement(Dashboard, { user: user, onLogout: () => { setUser(null); setScreen("login"); }, onAdmin: () => setScreen("adminLogin"), maintActive: maintActive }),
+        screen === "adminLogin" && React.createElement(AdminLogin, { onSuccess: () => setScreen("admin"), onBack: () => setScreen(user ? "app" : "login") }),
+        screen === "admin" && React.createElement(AdminDashboard, { onLogout: () => setScreen(user ? "app" : "login"), onMaintChange: v => { MAINT.active = v; setMaintActive(v); } })));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App, null));
+
+  </script>
+</body>
+</html>
